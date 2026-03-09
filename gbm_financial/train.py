@@ -32,7 +32,8 @@ from tqdm import tqdm
 from .sde import get_sde, get_sigma
 from .score_network import FinancialScoreNetwork
 from .metrics import (evaluate_stylized_facts, plot_stylized_facts,
-                      plot_diagnostics, plot_pathwise_diagnostics)
+                      plot_diagnostics, plot_pathwise_diagnostics,
+                      plot_mean_path_diagnostic)
 
 
 class EMA:
@@ -158,15 +159,25 @@ class GBMFinancialDiffusion:
         else:
             print(f"  {config['sde_type'].upper()} SDE → data_mode=log_return (raw log-returns)")
 
-        # Data standardization: normalize training data to zero mean, unit std.
-        # This ensures the noise schedule (sigma_min=0.01..sigma_max=1.0) is
-        # well-matched to the data scale. Without this, data with std=0.17 has
-        # SNR<1 for most of the diffusion schedule, making low-noise regimes
-        # almost unreachable by the model.
-        # After generation, samples are denormalized back to original scale.
+        # Data standardization.
+        #
+        # For GBM/log_price mode: DISABLED by default (matching the paper).
+        # Anchored log-price paths have a natural scale where σ_min=0.01,
+        # σ_max=1.0 is already well-matched to data (daily Δ≈0.01, path
+        # range≈1-2).  Global z-score normalization introduces an implicit
+        # restoring force toward the dataset-average path shape, causing
+        # mean-reverting synthetic paths.  See Audit D diagnosis.
+        #
+        # For VE/VP on raw log-returns: may still be useful since return
+        # distributions are roughly stationary and have no drift structure.
+        #
+        # If you need scale adjustment for GBM, prefer tuning σ_min/σ_max
+        # rather than normalizing the trajectories.
         self.data_mean = 0.0
         self.data_std = 1.0
-        self.normalize_data = config.get("normalize_data", True)
+        # Default: off for GBM (log-price paths), on for VE/VP (returns)
+        default_normalize = self.data_mode != "log_price"
+        self.normalize_data = config.get("normalize_data", default_normalize)
 
         # Anchor-zero masking: when data_mode='log_price', each subsequence is
         # anchored at 0 via window - window[0].  The first timestep is always
@@ -566,6 +577,11 @@ class GBMFinancialDiffusion:
                 plot_pathwise_diagnostics(
                     generated_data, real_data, mode=self.data_mode,
                     save_path=os.path.join(save_dir, "pathwise_diagnostics.png")
+                )
+                # Cross-sectional mean path diagnostic (z-score diagnosis)
+                plot_mean_path_diagnostic(
+                    generated_data, real_data, mode=self.data_mode,
+                    save_path=os.path.join(save_dir, "mean_path_diagnostic.png")
                 )
 
         return gen_results, real_results

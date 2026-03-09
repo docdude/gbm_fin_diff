@@ -1213,3 +1213,167 @@ def plot_pathwise_diagnostics(gen_data, real_data, mode="log_return",
     plt.close()
 
     return gen_pw, real_pw
+
+# ============================================================================
+# Cross-sectional mean path diagnostic (z-score diagnosis tool)
+# ============================================================================
+
+def compute_cross_sectional_stats(data):
+    """Compute cross-sectional mean path and percentile envelopes.
+
+    For a batch of (N, L) paths, compute at each time step t:
+      - mean(t) = (1/N) Σᵢ xᵢ(t)
+      - std(t)
+      - 10th/90th percentile envelope
+
+    If paths are mean-reverting (z-score artefact), the cross-sectional std
+    will be much smaller than expected from independent random walks.
+
+    Args:
+        data: (N, L) array of paths (log-price or cumulative log-returns)
+
+    Returns:
+        dict with keys: mean_path, std_path, p10, p90, terminal_values
+    """
+    data = np.asarray(data, dtype=np.float64)
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D array, got shape {data.shape}")
+
+    mean_path = np.mean(data, axis=0)
+    std_path = np.std(data, axis=0)
+    p10 = np.percentile(data, 10, axis=0)
+    p90 = np.percentile(data, 90, axis=0)
+    terminal_values = data[:, -1]
+
+    return {
+        "mean_path": mean_path,
+        "std_path": std_path,
+        "p10": p10,
+        "p90": p90,
+        "terminal_values": terminal_values,
+        "n_paths": data.shape[0],
+        "path_length": data.shape[1],
+    }
+
+
+def plot_mean_path_diagnostic(gen_data, real_data, mode="log_price",
+                              save_path=None, title_suffix=""):
+    """Plot cross-sectional mean path diagnostic — the key z-score test.
+
+    Two panels:
+      Left:  Mean path ± 1σ envelope for real vs generated
+      Right: Terminal value distribution (histogram)
+
+    If the model learned a mean-reverting score (z-score artefact):
+      - Generated mean path will hug the real mean path too closely
+      - Generated terminal value distribution will be much narrower
+      - Generated σ envelope will be compressed
+
+    After fix (no z-score): generated paths should fan out similarly to real.
+
+    Args:
+        gen_data: (N, L) generated paths
+        real_data: (N, L) real paths
+        mode: 'log_price' or 'log_return'
+        save_path: path to save figure (optional)
+        title_suffix: extra text for title (e.g., "z-scored model" vs "raw model")
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available for plotting")
+        return None
+
+    gen_stats = compute_cross_sectional_stats(gen_data)
+    real_stats = compute_cross_sectional_stats(real_data)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    t = np.arange(gen_stats["path_length"])
+
+    # ---- Left: Mean path ± σ envelope ----
+    ax = axes[0]
+    ax.plot(t, real_stats["mean_path"], color="red", linewidth=1.5,
+            label=f"Real mean (N={real_stats['n_paths']})")
+    ax.fill_between(t,
+                    real_stats["mean_path"] - real_stats["std_path"],
+                    real_stats["mean_path"] + real_stats["std_path"],
+                    color="red", alpha=0.15, label="Real ±1σ")
+    ax.fill_between(t, real_stats["p10"], real_stats["p90"],
+                    color="red", alpha=0.08, label="Real 10–90%")
+
+    ax.plot(t, gen_stats["mean_path"], color="blue", linewidth=1.5,
+            label=f"Gen mean (N={gen_stats['n_paths']})")
+    ax.fill_between(t,
+                    gen_stats["mean_path"] - gen_stats["std_path"],
+                    gen_stats["mean_path"] + gen_stats["std_path"],
+                    color="blue", alpha=0.15, label="Gen ±1σ")
+    ax.fill_between(t, gen_stats["p10"], gen_stats["p90"],
+                    color="blue", alpha=0.08, label="Gen 10–90%")
+
+    ax.set_xlabel("Time step")
+    ax.set_ylabel("Cumulative log-price" if mode == "log_price" else "Value")
+    ax.set_title("Cross-Sectional Mean Path ± Spread")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.3)
+
+    # Report path std ratio at terminal step
+    real_term_std = real_stats["std_path"][-1]
+    gen_term_std = gen_stats["std_path"][-1]
+    ratio = gen_term_std / real_term_std if real_term_std > 0 else float("nan")
+    ax.text(0.02, 0.02,
+            f"Terminal σ ratio: {ratio:.2f}  (gen/real)\n"
+            f"Real σ(T)={real_term_std:.4f}  Gen σ(T)={gen_term_std:.4f}",
+            transform=ax.transAxes, fontsize=8, verticalalignment="bottom",
+            bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
+    # ---- Right: Terminal value distribution ----
+    ax = axes[1]
+    bins = np.linspace(
+        min(real_stats["terminal_values"].min(), gen_stats["terminal_values"].min()),
+        max(real_stats["terminal_values"].max(), gen_stats["terminal_values"].max()),
+        50,
+    )
+    ax.hist(real_stats["terminal_values"], bins=bins, density=True,
+            alpha=0.5, color="red", label=f"Real (μ={np.mean(real_stats['terminal_values']):.3f})")
+    ax.hist(gen_stats["terminal_values"], bins=bins, density=True,
+            alpha=0.5, color="blue", label=f"Gen (μ={np.mean(gen_stats['terminal_values']):.3f})")
+    ax.set_xlabel("Terminal value x(T)")
+    ax.set_ylabel("Density")
+    ax.set_title("Terminal Value Distribution")
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    suptitle = "Cross-Sectional Mean Path Diagnostic"
+    if title_suffix:
+        suptitle += f" — {title_suffix}"
+    plt.suptitle(suptitle, fontsize=13, y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        print(f"Mean path diagnostic saved to {save_path}")
+    plt.close()
+
+    # Print summary
+    print(f"\n{'='*60}")
+    print("Cross-Sectional Mean Path Summary")
+    print(f"{'='*60}")
+    print(f"  Real: N={real_stats['n_paths']}, L={real_stats['path_length']}")
+    print(f"  Gen:  N={gen_stats['n_paths']}, L={gen_stats['path_length']}")
+    print(f"  Terminal σ — Real: {real_term_std:.4f}  Gen: {gen_term_std:.4f}  "
+          f"Ratio: {ratio:.2f}")
+    print(f"  Terminal μ — Real: {np.mean(real_stats['terminal_values']):.4f}  "
+          f"Gen: {np.mean(gen_stats['terminal_values']):.4f}")
+    if ratio < 0.5:
+        print("  ⚠ WARNING: Generated path spread is <50% of real → "
+              "likely mean-reverting (z-score artefact)")
+    elif ratio > 1.5:
+        print("  ⚠ WARNING: Generated path spread is >150% of real → "
+              "possible instability")
+    else:
+        print("  ✓ Terminal spread ratio near 1.0 — paths fan out correctly")
+    print(f"{'='*60}\n")
+
+    return gen_stats, real_stats

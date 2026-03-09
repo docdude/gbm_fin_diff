@@ -34,7 +34,8 @@ import torch
 from gbm_financial.train import GBMFinancialDiffusion
 from gbm_financial.data import get_dataloaders, download_stock_data, LONG_HISTORY_TICKERS
 from gbm_financial.metrics import (evaluate_stylized_facts, plot_stylized_facts,
-                                   plot_diagnostics, plot_pathwise_diagnostics)
+                                   plot_diagnostics, plot_pathwise_diagnostics,
+                                   plot_mean_path_diagnostic)
 
 
 # Paper's full configuration (Section 4)
@@ -71,6 +72,10 @@ PAPER_CONFIG = {
 
     # Generation
     "n_generate": 120,
+
+    # No z-score normalization for GBM/log-price (paper faithful).
+    # Global z-score of cumulative paths induces mean-reversion.
+    "normalize_data": False,
 }
 
 # Reduced config for quick validation on L4
@@ -210,6 +215,10 @@ def run_experiment(config, save_dir, resume_path=None):
     # Pathwise diagnostics (Audit D expansion)
     plot_pathwise_diagnostics(generated, real_data, mode=mode,
                               save_path=os.path.join(exp_dir, "pathwise_diagnostics.png"))
+
+    # Cross-sectional mean path diagnostic (z-score diagnosis)
+    plot_mean_path_diagnostic(generated, real_data, mode=mode,
+                              save_path=os.path.join(exp_dir, "mean_path_diagnostic.png"))
 
     # Save results
     results = {
