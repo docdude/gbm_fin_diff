@@ -33,19 +33,22 @@ LONG_HISTORY_TICKERS = [
     "IBM", "XOM", "CVX", "CL", "EMR", "SYY", "ADP", "DOV", "ITW", "PH",
     "SWK", "GPC", "LOW", "TGT", "BDX", "SHW", "ECL", "AFL", "ED", "ATO",
     "MDT", "CAT", "DE", "HON", "WMT", "HD", "MCD", "DIS", "NKE", "TXN",
-    "INTC", "CSCO", "ORCL", "UNP", "FDX", "UPS", "LMT", "RTX", "BA", "GD",
-    "NOC", "GIS", "K", "HRL", "SJM", "CPB", "MKC", "HSY", "CLX", "CHD",
-    "BEN", "TROW", "CINF", "CB", "MMC", "AIG", "TRV", "ALL", "PFG", "LNC",
+    "INTC", "CSCO", "ORCL", "UNP", "FDX", "UPS", "LMT", "BA", "GD",
+    "NOC", "GIS", "HRL", "SJM", "CPB", "MKC", "HSY", "CLX", "CHD",
+    "BEN", "TROW", "CINF", "CB", "MMC", "AIG", "TRV", "ALL",
     "WFC", "JPM", "BAC", "C", "GS", "MS", "USB", "PNC", "BK", "STT",
     "SO", "DUK", "NEE", "D", "AEE", "WEC", "CMS", "ES", "EXC", "AEP",
     "PPL", "FE", "ETR", "XEL", "DTE", "SRE", "NI", "PNW", "OKE", "KMI",
-    "ADM", "APD", "LIN", "DD", "PPG", "NUE", "FCX", "IP", "PKG", "WRK",
-    "AVY", "SEE", "BLL", "AMCR", "RPM", "FAST", "GWW", "WST", "ROP", "IFF",
-    "WAT", "A", "TMO", "DHR", "STE", "HOLX", "BAX", "ZBH", "EW", "BSX",
-    "AMGN", "GILD", "BIIB", "REGN", "VRTX", "LLY", "PFE", "BMY",
-    "CVS", "UNH", "CI", "HUM", "CNC", "ANTM",
+    "ADM", "APD", "LIN", "DD", "PPG", "NUE", "FCX", "IP", "PKG",
+    "AVY", "RPM", "FAST", "GWW", "WST", "ROP", "IFF",
+    "WAT", "A", "TMO", "DHR", "BAX", "EW", "BSX",
+    "AMGN", "GILD", "BIIB", "LLY", "PFE", "BMY",
+    "CVS", "UNH", "CI", "ELV",  # ANTM → ELV (Elevance Health)
     "SPY"  # S&P 500 ETF as benchmark
 ]
+# Removed: K (→ KLG after spinoff), RTX (formed 2020), PFG/LNC (delisted),
+#   WRK/AMCR/SEE/BLL (short history), HOLX/STE/ZBH (short history),
+#   REGN/VRTX/CNC/HUM (short history), ANTM (→ ELV)
 
 
 def load_csv_data(csv_path="data/sp500.csv"):
