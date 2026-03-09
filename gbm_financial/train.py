@@ -162,17 +162,19 @@ class GBMFinancialDiffusion:
         # Data standardization.
         #
         # For GBM/log_price mode: DISABLED by default (matching the paper).
-        # Anchored log-price paths have a natural scale where σ_min=0.01,
-        # σ_max=1.0 is already well-matched to data (daily Δ≈0.01, path
-        # range≈1-2).  Global z-score normalization introduces an implicit
-        # restoring force toward the dataset-average path shape, causing
-        # mean-reverting synthetic paths.  See Audit D diagnosis.
+        # Anchored log-price paths have a natural scale where σ_min=0.01
+        # matches daily return magnitude (~0.012).  σ_max is auto-computed
+        # from the data (typically 5–10) to ensure the VE SDE prior N(0, σ_max²)
+        # covers the actual marginal at t=T.  With σ_max=1.0 on raw paths
+        # (range [-1, 3]), KL(marginal ∥ prior) = 0.16 → severe mismatch.
         #
-        # For VE/VP on raw log-returns: may still be useful since return
-        # distributions are roughly stationary and have no drift structure.
+        # Global z-score normalization of cumulative paths induces
+        # mean-reversion (the score learns a restoring force toward the
+        # dataset-average path shape).  If scale adjustment is needed,
+        # prefer tuning σ_min/σ_max rather than normalizing trajectories.
         #
-        # If you need scale adjustment for GBM, prefer tuning σ_min/σ_max
-        # rather than normalizing the trajectories.
+        # For VE/VP on raw log-returns: z-score may still be useful since
+        # return distributions are roughly stationary and have no drift.
         self.data_mean = 0.0
         self.data_std = 1.0
         # Default: off for GBM (log-price paths), on for VE/VP (returns)

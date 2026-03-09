@@ -409,3 +409,61 @@ def get_dataloaders(sde_type="gbm", window_len=2048, stride=400, batch_size=64,
     }
 
     return train_loader, val_loader, data_info
+
+def compute_sigma_max(train_loader, percentile=99, n_max=1000):
+    """Compute recommended σ_max for VE/GBM SDE from data pairwise distances.
+
+    Song et al. (2020) recommend σ_max ≈ max pairwise distance (per element)
+    so that at t=T the prior N(0, σ_max²) fully obscures the signal.
+
+    For cumulative log-price paths, the per-element variance grows with
+    position (drift structure), so σ_max must cover the MAXIMUM spread.
+
+    Returns a conservative estimate: p99 of the per-element range across
+    training samples, multiplied by a safety factor of 3.
+
+    Args:
+        train_loader: DataLoader yielding (B, L) tensors
+        percentile: percentile of per-element range to use (default 99)
+        n_max: max samples to use (for speed)
+
+    Returns:
+        recommended σ_max (float), data_stats dict
+    """
+    all_data = []
+    for batch in train_loader:
+        all_data.append(batch.numpy())
+        if sum(len(b) for b in all_data) >= n_max:
+            break
+    all_data = np.concatenate(all_data, axis=0)[:n_max]
+
+    # Per-element statistics across samples
+    elem_std = all_data.std(axis=0)         # (L,)
+    elem_range = all_data.max(axis=0) - all_data.min(axis=0)  # (L,)
+    global_std = all_data.std()
+    global_range = all_data.max() - all_data.min()
+
+    # Conservative σ_max: 3× the p99 per-element range (ensures KL < 0.01)
+    max_elem_range = np.percentile(elem_range, percentile)
+    sigma_max = 3.0 * max(global_std, max_elem_range / 2)
+
+    # Floor at 5.0 to avoid edge cases with small datasets
+    sigma_max = max(sigma_max, 5.0)
+
+    stats = {
+        "global_mean": float(all_data.mean()),
+        "global_std": float(global_std),
+        "global_range": float(global_range),
+        "max_elem_std": float(elem_std.max()),
+        "max_elem_range": float(max_elem_range),
+        "n_samples": len(all_data),
+        "seq_len": all_data.shape[1],
+        "sigma_max": float(sigma_max),
+    }
+
+    print(f"\n  σ_max auto-compute: global_std={global_std:.4f}, "
+          f"max_elem_range(p{percentile})={max_elem_range:.4f}")
+    print(f"  → σ_max = {sigma_max:.1f}  "
+          f"(3× max(global_std, range/2), floor=5.0)")
+
+    return float(sigma_max), stats

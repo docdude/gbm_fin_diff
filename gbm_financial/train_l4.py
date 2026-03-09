@@ -32,7 +32,8 @@ import numpy as np
 import torch
 
 from gbm_financial.train import GBMFinancialDiffusion
-from gbm_financial.data import get_dataloaders, download_stock_data, LONG_HISTORY_TICKERS
+from gbm_financial.data import (get_dataloaders, download_stock_data,
+                               LONG_HISTORY_TICKERS, compute_sigma_max)
 from gbm_financial.metrics import (evaluate_stylized_facts, plot_stylized_facts,
                                    plot_diagnostics, plot_pathwise_diagnostics,
                                    plot_mean_path_diagnostic)
@@ -44,7 +45,7 @@ PAPER_CONFIG = {
     "sde_type": "gbm",
     "schedule": "exponential",
     "sigma_min": 0.01,
-    "sigma_max": 1.0,
+    "sigma_max": "auto",   # Auto-computed from data (≈ 3× data range)
     "n_reverse_steps": 2000,
 
     # Architecture (Section 3.1.1)
@@ -177,6 +178,18 @@ def run_experiment(config, save_dir, resume_path=None):
     if total_steps < 5000:
         print(f"  WARNING: Only {total_steps} steps — may be too few for convergence.")
         print(f"  Consider: pip install yfinance (more stocks), or reduce stride, or increase epochs.")
+
+    # Auto-compute σ_max from data if set to "auto"
+    # Song et al. (2020): σ_max should be large enough that the prior N(0, σ_max²)
+    # approximates the noised marginal at t=T.  With σ_max=1.0 on raw log-price
+    # paths (range [-1, 3], std≈0.6), KL(marginal||prior)=0.16 → severe mismatch.
+    # Auto-compute picks σ_max ≈ 3× data std (typically 5-10), giving KL < 0.01.
+    if config.get("sigma_max") == "auto":
+        sigma_max, sigma_stats = compute_sigma_max(train_loader)
+        config["sigma_max"] = sigma_max
+        print(f"  σ_max auto-set to {sigma_max:.1f}")
+    elif isinstance(config.get("sigma_max"), str):
+        raise ValueError(f"Unknown sigma_max value: {config['sigma_max']}")
 
     # Model
     model = GBMFinancialDiffusion(config)

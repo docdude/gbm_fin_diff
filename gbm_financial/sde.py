@@ -294,10 +294,14 @@ class GBMSDE(VESDE):
 
   This is the paper's main contribution (Section 3.1).
 
-  Uses σ_min=0.01, σ_max=1.0 as per the paper (not the image default of 50).
+  Paper states σ_min=0.01, σ_max=1.0, but σ_max=1.0 only works for
+  normalized data.  For raw anchored log-price paths (range [-1, 3]),
+  σ_max should be auto-computed from data pairwise distances (typically
+  5–10) so the prior N(0, σ_max²) fully obscures the signal at t=T.
+  See train_l4.py's auto-compute logic.
   """
 
-  def __init__(self, sigma_min=0.01, sigma_max=1.0, N=2000):
+  def __init__(self, sigma_min=0.01, sigma_max=5.0, N=2000):
     super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, N=N)
 
 
