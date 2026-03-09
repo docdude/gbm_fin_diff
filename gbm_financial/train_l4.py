@@ -82,9 +82,9 @@ QUICK_CONFIG = {
     "n_heads": 4,
     "seq_len": 512,
     "window_len": 512,
-    "epochs": 200,
+    "epochs": 500,
     "n_reverse_steps": 500,
-    "stride": 100,
+    "stride": 25,         # small stride → more windows from single-stock CSV
     "n_generate": 60,
 }
 
@@ -144,8 +144,14 @@ def run_experiment(config, save_dir, resume_path=None):
         min_years=config.get("min_years", 40),
         num_workers=2,
     )
+    n_batches = len(train_loader)
+    total_steps = config["epochs"] * n_batches
     print(f"Data: {data_info['n_train']} train, {data_info['n_val']} val "
           f"({data_info['n_stocks']} stocks)")
+    print(f"  {n_batches} batches/epoch → {total_steps} total gradient steps")
+    if total_steps < 5000:
+        print(f"  WARNING: Only {total_steps} steps — may be too few for convergence.")
+        print(f"  Consider: pip install yfinance (more stocks), or reduce stride, or increase epochs.")
 
     # Model
     model = GBMFinancialDiffusion(config)
