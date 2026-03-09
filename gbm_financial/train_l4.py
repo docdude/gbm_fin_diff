@@ -33,7 +33,8 @@ import torch
 
 from gbm_financial.train import GBMFinancialDiffusion
 from gbm_financial.data import get_dataloaders, download_stock_data, LONG_HISTORY_TICKERS
-from gbm_financial.metrics import evaluate_stylized_facts, plot_stylized_facts, plot_diagnostics
+from gbm_financial.metrics import (evaluate_stylized_facts, plot_stylized_facts,
+                                   plot_diagnostics, plot_pathwise_diagnostics)
 
 
 # Paper's full configuration (Section 4)
@@ -205,6 +206,10 @@ def run_experiment(config, save_dir, resume_path=None):
     mode = "log_price" if sde_type == "gbm" else "log_return"
     plot_diagnostics(generated, real_data, mode=mode,
                      save_path=os.path.join(exp_dir, "diagnostics.png"))
+
+    # Pathwise diagnostics (Audit D expansion)
+    plot_pathwise_diagnostics(generated, real_data, mode=mode,
+                              save_path=os.path.join(exp_dir, "pathwise_diagnostics.png"))
 
     # Save results
     results = {

@@ -31,7 +31,8 @@ from tqdm import tqdm
 
 from .sde import get_sde, get_sigma
 from .score_network import FinancialScoreNetwork
-from .metrics import evaluate_stylized_facts, plot_stylized_facts, plot_diagnostics
+from .metrics import (evaluate_stylized_facts, plot_stylized_facts,
+                      plot_diagnostics, plot_pathwise_diagnostics)
 
 
 class EMA:
@@ -167,6 +168,14 @@ class GBMFinancialDiffusion:
         self.data_std = 1.0
         self.normalize_data = config.get("normalize_data", True)
 
+        # Anchor-zero masking: when data_mode='log_price', each subsequence is
+        # anchored at 0 via window - window[0].  The first timestep is always
+        # deterministic.  If mask_anchor=True, exclude it from the denoising loss
+        # so the network does not waste capacity learning an always-zero anchor.
+        self.mask_anchor = config.get("mask_anchor", True) and self.data_mode == "log_price"
+        if self.mask_anchor:
+            print(f"  Anchor masking: ON (first timestep excluded from loss)")
+
     def compute_loss(self, x_0, eps=1e-5):
         """Compute continuous-time denoising score matching loss.
 
@@ -179,6 +188,11 @@ class GBMFinancialDiffusion:
 
         For VE/GBM: x_t = x_0 + σ_t * ε → target = ε
         For VP:     x_t = √α_t * x_0 + √(1-α_t) * ε → target = ε
+
+        When mask_anchor=True and data_mode='log_price', the loss at position 0
+        is zeroed out because the first timestep is deterministic (always 0).
+        This prevents the model from overfitting to the boundary condition at
+        the expense of learning local dynamics in the interior of the path.
 
         Args:
             x_0: (B, L) clean data
@@ -209,6 +223,13 @@ class GBMFinancialDiffusion:
         # For VE/GBM: loss = ||ε - ε_θ||² (equivalent to ||σ·score + ε||²)
         # For VP: same ε-prediction loss
         losses = (z - eps_pred) ** 2
+
+        # Mask anchor position: the first timestep is deterministic (always 0)
+        # when training on anchored log-price paths.  Zeroing its loss prevents
+        # the network from overfitting to the boundary condition.
+        if self.mask_anchor:
+            losses = losses.clone()
+            losses[:, 0] = 0.0
 
         # Optional likelihood weighting: λ(t) = g(t)²/σ_t²
         # From score_sde: loss = g² * ||score + z/σ||² = (g²/σ²) * ||z - ε_θ||²
@@ -540,6 +561,11 @@ class GBMFinancialDiffusion:
                 plot_diagnostics(
                     generated_data, real_data, mode=self.data_mode,
                     save_path=os.path.join(save_dir, "diagnostics.png")
+                )
+                # 8-panel pathwise diagnostics (Audit D expansion)
+                plot_pathwise_diagnostics(
+                    generated_data, real_data, mode=self.data_mode,
+                    save_path=os.path.join(save_dir, "pathwise_diagnostics.png")
                 )
 
         return gen_results, real_results
