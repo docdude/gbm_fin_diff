@@ -73,9 +73,26 @@ PAPER_CONFIG = {
 }
 
 # Reduced config for quick validation on L4
-# Matches the proven config from CPU runs: window=256, stride=25, 1000 epochs
-# ~3500 gradient steps with single-stock CSV
+# Paper's data params (seq_len=2048, stride=400) but smaller model → faster
+# With ~40 stocks: ~800 windows, ~12 batches/epoch, 500 epochs = ~6000 steps
 QUICK_CONFIG = {
+    **PAPER_CONFIG,
+    "channels": 64,
+    "diff_emb_dim": 128,
+    "feat_emb_dim": 32,
+    "n_layers": 2,
+    "n_heads": 4,
+    "seq_len": 2048,
+    "window_len": 2048,
+    "epochs": 500,
+    "n_reverse_steps": 1000,
+    "stride": 200,        # denser than paper (400) for more data
+    "n_generate": 60,
+}
+
+# Minimal config for single-stock CSV (no yfinance)
+# Proven on CPU: window=256, stride=25, 1000 epochs → ~3500 steps
+MINIMAL_CONFIG = {
     **PAPER_CONFIG,
     "channels": 64,
     "diff_emb_dim": 128,
@@ -86,7 +103,7 @@ QUICK_CONFIG = {
     "window_len": 256,
     "epochs": 1000,
     "n_reverse_steps": 500,
-    "stride": 25,         # small stride → more windows from single-stock CSV
+    "stride": 25,
     "n_generate": 60,
 }
 
@@ -264,7 +281,9 @@ def main():
         description="L4 GPU training for GBM Financial Diffusion"
     )
     parser.add_argument("--quick", action="store_true",
-                        help="Use reduced config (~30 min)")
+                        help="Reduced model, paper data params (multi-stock, ~1-2h on L4)")
+    parser.add_argument("--minimal", action="store_true",
+                        help="Minimal config for single-stock CSV (window=256, ~5 min on L4)")
     parser.add_argument("--grid", action="store_true",
                         help="Run full 3×3 experiment grid")
     parser.add_argument("--resume", type=str, default=None,
@@ -283,7 +302,12 @@ def main():
                         help="Override sliding window stride")
     args = parser.parse_args()
 
-    config = QUICK_CONFIG.copy() if args.quick else PAPER_CONFIG.copy()
+    if args.minimal:
+        config = MINIMAL_CONFIG.copy()
+    elif args.quick:
+        config = QUICK_CONFIG.copy()
+    else:
+        config = PAPER_CONFIG.copy()
     if args.sde_type:
         config["sde_type"] = args.sde_type
     if args.schedule:
