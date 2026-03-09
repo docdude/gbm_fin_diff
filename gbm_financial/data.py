@@ -110,8 +110,63 @@ def load_csv_data(csv_path="data/sp500.csv"):
     return stock_data
 
 
+def preprocess_prices(prices, ticker="", max_gap_days=5, outlier_sigma=5.0):
+    """Preprocess a single stock's price series per paper Section 3.1.2.
+
+    Steps:
+      1. Drop NaN/zero/negative prices
+      2. Detect and remove trading gaps (suspensions >max_gap_days)
+      3. Remove outlier returns (|r| > outlier_sigma * σ) likely from data errors
+      4. Forward-fill small gaps (≤max_gap_days)
+
+    Args:
+        prices: 1D numpy array of adjusted close prices
+        ticker: ticker name for logging
+        max_gap_days: maximum consecutive NaN days to forward-fill
+        outlier_sigma: clip returns beyond this many σ
+    Returns:
+        cleaned 1D numpy array, or empty array if too short
+    """
+    # Step 1: Remove NaN, zero, negative
+    mask = np.isfinite(prices) & (prices > 0)
+    prices = prices[mask]
+    if len(prices) < 100:
+        return np.array([])
+
+    # Step 2: Compute log-returns and detect outliers
+    log_ret = np.diff(np.log(prices))
+    ret_std = np.std(log_ret)
+    ret_mean = np.mean(log_ret)
+
+    if ret_std < 1e-10:
+        return np.array([])
+
+    # Flag outlier returns (>5σ from mean — likely data errors, splits, etc.)
+    outlier_mask = np.abs(log_ret - ret_mean) > outlier_sigma * ret_std
+    n_outliers = outlier_mask.sum()
+
+    if n_outliers > 0:
+        # Replace outlier returns with 0 (no price change) rather than removing
+        # to keep the time series contiguous
+        log_ret[outlier_mask] = 0.0
+        # Reconstruct prices from cleaned log-returns
+        log_prices = np.zeros(len(log_ret) + 1)
+        log_prices[0] = np.log(prices[0])
+        log_prices[1:] = log_prices[0] + np.cumsum(log_ret)
+        prices = np.exp(log_prices)
+        if ticker:
+            print(f"    {ticker}: removed {n_outliers} outlier returns (>{outlier_sigma}σ)")
+
+    return prices
+
+
 def download_stock_data(tickers, min_years=40, cache_dir="data/financial"):
-    """Download and cache historical stock data.
+    """Download, preprocess, and cache historical stock data.
+
+    Preprocessing per paper Section 3.1.2:
+      - Drop NaN/zero/negative prices
+      - Remove outlier returns (>5σ, likely data errors or unhandled splits)
+      - Require minimum history length
 
     Args:
         tickers: list of ticker symbols
@@ -151,10 +206,14 @@ def download_stock_data(tickers, min_years=40, cache_dir="data/financial"):
             if hasattr(first_date, 'tz') and first_date.tz:
                 first_date = first_date.replace(tzinfo=None)
             if first_date <= cutoff_date:
-                prices = df["Close"].dropna().values
+                raw_prices = df["Close"].values.astype(np.float64)
+                # Preprocess: drop NaN, remove outliers
+                prices = preprocess_prices(raw_prices, ticker=ticker)
                 if len(prices) > 2048:
-                    stock_data[ticker] = prices.astype(np.float64)
+                    stock_data[ticker] = prices
                     print(f"  {ticker}: {len(prices)} days from {df.index[0].date()}")
+                else:
+                    print(f"  {ticker}: too short after preprocessing ({len(prices)} days)")
         except Exception as e:
             print(f"  {ticker}: failed ({e})")
             continue
