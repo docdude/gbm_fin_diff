@@ -1,0 +1,7 @@
+torch>=1.12
+numpy>=1.21
+matplotlib>=3.5
+scipy>=1.7
+tqdm>=4.62
+pyyaml>=5.4
+pandas>=1.3

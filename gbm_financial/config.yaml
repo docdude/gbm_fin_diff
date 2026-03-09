@@ -1,0 +1,58 @@
+# Configuration for GBM Financial Diffusion Model
+# Based on paper: "A diffusion-based generative model for financial time series
+# via geometric Brownian motion" (arXiv:2507.19003)
+
+# ========================
+# SDE Configuration
+# ========================
+# sde_type: 've', 'vp', or 'gbm' (paper's main contribution)
+# schedule: 'linear', 'exponential', or 'cosine'
+# SDE classes ported from score_sde (JAX) → PyTorch in sde.py
+
+sde_type: "gbm"
+schedule: "exponential"  # paper finds exponential+GBM gives α≈4.62 (closest to 4.35)
+sigma_min: 0.01
+sigma_max: 1.0
+n_reverse_steps: 2000   # N=2000 per paper Section 4
+
+# ========================
+# Score Network Architecture (Section 3.1.1)
+# ========================
+# Wraps original CSDI diff_CSDI (diff_models.py) with two modifications:
+#   1. Positional encoding before Transformer (ResidualBlockWithPosEnc)
+#   2. Increased hyperparameters below (paper's "128/256/64" configuration)
+#
+# Vanilla CSDI defaults (for reference): channels=64, diff_emb_dim=128, feat_emb_dim=16
+# time_emb_dim unchanged from CSDI default (128)
+
+seq_len: 2048
+channels: 128              # conv channels (CSDI default: 64)
+diff_emb_dim: 256          # diffusion embedding dim (CSDI default: 128)
+feat_emb_dim: 64           # feature embedding dim (CSDI default: 16)
+time_emb_dim: 128          # temporal position embedding dim (same as CSDI)
+n_layers: 4                # residual blocks (same as CSDI)
+n_heads: 8                 # attention heads (same as CSDI)
+
+# ========================
+# Training (Section 4)
+# ========================
+epochs: 1000
+batch_size: 64
+lr: 1.0e-3
+weight_decay: 1.0e-6
+ema_decay: 0.999             # EMA of model weights (score_sde default; paper omits this)
+likelihood_weighting: false  # λ(t) = σ_t² weighting (score_sde default for VE)
+
+# ========================
+# Data (Section 3.1.2)
+# ========================
+window_len: 2048       # sliding window length
+stride: 100            # sliding window stride (paper uses 400 with many stocks;
+                       # reduced for single-stock CSV to get sufficient windows)
+min_years: 40          # minimum stock history in years
+use_synthetic: false   # set true to use synthetic GBM data (no download)
+
+# ========================
+# Generation
+# ========================
+n_generate: 120        # number of synthetic series to generate per evaluation

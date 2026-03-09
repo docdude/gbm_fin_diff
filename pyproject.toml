@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "gbm-fin-diff"
+version = "0.1.0"
+description = "A diffusion-based generative model for financial time series via geometric Brownian motion"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+    {name = "GBM-Diffusion Authors"},
+]
+
+dependencies = [
+    "torch>=1.12",
+    "numpy>=1.21",
+    "matplotlib>=3.5",
+    "scipy>=1.7",
+    "tqdm>=4.62",
+    "pyyaml>=5.4",
+    "pandas>=1.3",
+]
+
+[project.optional-dependencies]
+download = ["yfinance>=0.2"]
+attention = ["linear-attention-transformer>=0.19"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+gbm-fin-diff = "gbm_financial.run:main"
+
+[tool.setuptools.packages.find]
+include = ["gbm_financial*"]

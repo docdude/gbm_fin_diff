@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Model artifacts
+*.pth
+*.pt
+*.ckpt
+checkpoints/
+results/
+
+# Data artifacts (keep sp500.csv)
+*.npy
+*.npz
+*.pkl
+
+# Plots
+*.png
+*.pdf
+*.svg
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/

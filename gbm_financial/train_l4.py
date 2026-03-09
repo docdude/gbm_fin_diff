@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""
+L4 GPU training script for GBM Financial Diffusion Model.
+
+Designed for Lightning AI Studio with L4 GPU (24GB VRAM).
+Uses paper's full hyperparameters: 128/256/64, 4 layers, 8 heads,
+seq_len=2048, 1000 epochs, N=2000.
+
+Multi-stock data: downloads S&P 500 constituents with >40 years history
+to match the paper's data collection methodology (Section 3.1.2).
+
+Usage:
+    # Full paper reproduction (GBM + exponential, ~8 hours on L4):
+    python -m gbm_financial.train_l4
+
+    # Quick test (smaller config, ~30 min):
+    python -m gbm_financial.train_l4 --quick
+
+    # Full 3x3 experiment grid:
+    python -m gbm_financial.train_l4 --grid
+
+    # Resume from checkpoint:
+    python -m gbm_financial.train_l4 --resume save/gbm_financial/gbm_exponential/checkpoint_epoch500.pth
+"""
+
+import argparse
+import os
+import sys
+import json
+import time
+import numpy as np
+import torch
+
+from gbm_financial.train import GBMFinancialDiffusion
+from gbm_financial.data import get_dataloaders, download_stock_data, LONG_HISTORY_TICKERS
+from gbm_financial.metrics import evaluate_stylized_facts, plot_stylized_facts, plot_diagnostics
+
+
+# Paper's full configuration (Section 4)
+PAPER_CONFIG = {
+    # SDE
+    "sde_type": "gbm",
+    "schedule": "exponential",
+    "sigma_min": 0.01,
+    "sigma_max": 1.0,
+    "n_reverse_steps": 2000,
+
+    # Architecture (Section 3.1.1)
+    "channels": 128,
+    "diff_emb_dim": 256,
+    "feat_emb_dim": 64,
+    "time_emb_dim": 128,
+    "n_layers": 4,
+    "n_heads": 8,
+
+    # Training (Section 4)
+    "seq_len": 2048,
+    "epochs": 1000,
+    "batch_size": 64,
+    "lr": 1e-3,
+    "weight_decay": 1e-6,
+    "ema_decay": 0.999,
+    "likelihood_weighting": False,
+
+    # Data (Section 3.1.2)
+    "window_len": 2048,
+    "stride": 400,
+    "min_years": 40,
+    "use_synthetic": False,
+
+    # Generation
+    "n_generate": 120,
+}
+
+# Reduced config for quick validation on L4 (~30 min)
+QUICK_CONFIG = {
+    **PAPER_CONFIG,
+    "channels": 64,
+    "diff_emb_dim": 128,
+    "feat_emb_dim": 32,
+    "n_layers": 2,
+    "n_heads": 4,
+    "seq_len": 512,
+    "window_len": 512,
+    "epochs": 200,
+    "n_reverse_steps": 500,
+    "stride": 100,
+    "n_generate": 60,
+}
+
+
+def ensure_data(config, csv_path="data/sp500.csv"):
+    """Ensure financial data is available.
+
+    Priority:
+      1. Local CSV (data/sp500.csv) — single stock, limited windows
+      2. yfinance download — multiple stocks, paper's methodology
+
+    For paper reproduction, yfinance with multiple stocks is needed.
+    """
+    if os.path.exists(csv_path):
+        print(f"Found local CSV: {csv_path}")
+        # Check if we also have multi-stock cache
+        cache_file = "data/financial/sp500_prices.pkl"
+        if os.path.exists(cache_file):
+            print(f"Also found multi-stock cache: {cache_file}")
+        else:
+            print("TIP: For paper reproduction, install yfinance to download multiple stocks:")
+            print("     pip install yfinance")
+            print("     This gives 10-100x more training data.")
+    else:
+        print("No local CSV found. Attempting yfinance download...")
+        try:
+            import yfinance
+            download_stock_data(LONG_HISTORY_TICKERS, min_years=config.get("min_years", 40))
+        except ImportError:
+            print("ERROR: yfinance not installed. Install it or provide data/sp500.csv")
+            print("       pip install yfinance")
+            sys.exit(1)
+
+
+def run_experiment(config, save_dir, resume_path=None):
+    """Run a single experiment with the given config."""
+    sde_type = config["sde_type"]
+    schedule = config["schedule"]
+    exp_dir = os.path.join(save_dir, f"{sde_type}_{schedule}")
+
+    print(f"\n{'=' * 70}")
+    print(f"  {sde_type.upper()} + {schedule}")
+    print(f"  Channels={config['channels']}, Layers={config['n_layers']}, "
+          f"Heads={config['n_heads']}")
+    print(f"  seq_len={config['seq_len']}, epochs={config['epochs']}, "
+          f"batch_size={config['batch_size']}")
+    print(f"  N_reverse={config['n_reverse_steps']}")
+    print(f"{'=' * 70}")
+
+    # Data
+    train_loader, val_loader, data_info = get_dataloaders(
+        sde_type=sde_type,
+        window_len=config["seq_len"],
+        stride=config.get("stride", 400),
+        batch_size=config["batch_size"],
+        use_synthetic=config.get("use_synthetic", False),
+        min_years=config.get("min_years", 40),
+        num_workers=2,
+    )
+    print(f"Data: {data_info['n_train']} train, {data_info['n_val']} val "
+          f"({data_info['n_stocks']} stocks)")
+
+    # Model
+    model = GBMFinancialDiffusion(config)
+
+    if resume_path:
+        model.load(resume_path)
+        print(f"Resumed from {resume_path}")
+
+    # Train
+    start = time.time()
+    model.train(train_loader, val_loader, save_dir=exp_dir)
+    train_time = time.time() - start
+    print(f"Training time: {train_time / 3600:.1f} hours")
+
+    # Generate
+    n_gen = config.get("n_generate", 120)
+    generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
+    np.save(os.path.join(exp_dir, "generated_data.npy"), generated)
+
+    # Get real data for comparison
+    real_data = []
+    for batch in train_loader:
+        real_data.append(batch.numpy())
+        if sum(len(b) for b in real_data) >= n_gen:
+            break
+    real_data = np.concatenate(real_data, axis=0)[:n_gen]
+
+    # Evaluate
+    gen_results, real_results = model.evaluate(generated, real_data, save_dir=exp_dir)
+
+    # Full diagnostics plot
+    mode = "log_price" if sde_type == "gbm" else "log_return"
+    plot_diagnostics(generated, real_data, mode=mode,
+                     save_path=os.path.join(exp_dir, "diagnostics.png"))
+
+    # Save results
+    results = {
+        "sde_type": sde_type,
+        "schedule": schedule,
+        "alpha_gen": gen_results["heavy_tail"]["alpha"],
+        "alpha_real": real_results["heavy_tail"]["alpha"] if real_results else None,
+        "beta_gen": gen_results["volatility_clustering"]["beta"],
+        "beta_real": real_results["volatility_clustering"]["beta"] if real_results else None,
+        "n_train": data_info["n_train"],
+        "n_stocks": data_info["n_stocks"],
+        "train_time_hours": train_time / 3600,
+        "config": {k: v for k, v in config.items()
+                   if isinstance(v, (int, float, str, bool))},
+    }
+
+    with open(os.path.join(exp_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2, default=str)
+
+    return results
+
+
+def run_grid(base_config, save_dir):
+    """Run all 9 SDE × schedule combinations from the paper."""
+    sde_types = ["ve", "vp", "gbm"]
+    schedules = ["linear", "exponential", "cosine"]
+
+    all_results = []
+
+    for sde_type in sde_types:
+        for schedule in schedules:
+            config = base_config.copy()
+            config["sde_type"] = sde_type
+            config["schedule"] = schedule
+
+            try:
+                result = run_experiment(config, save_dir)
+                all_results.append(result)
+            except Exception as e:
+                print(f"\nERROR in {sde_type}/{schedule}: {e}")
+                import traceback
+                traceback.print_exc()
+                all_results.append({
+                    "sde_type": sde_type,
+                    "schedule": schedule,
+                    "error": str(e),
+                })
+
+    # Print results table (matches paper Table 1)
+    print(f"\n{'=' * 80}")
+    print("RESULTS (compare with paper Table 1)")
+    print(f"{'=' * 80}")
+    print(f"{'SDE':<6} {'Schedule':<14} {'α (gen)':<10} {'α (real)':<10} "
+          f"{'β (gen)':<10} {'β (real)':<10}")
+    print("-" * 64)
+    for r in all_results:
+        if "error" in r:
+            print(f"{r['sde_type']:<6} {r['schedule']:<14} ERROR")
+        else:
+            print(f"{r['sde_type']:<6} {r['schedule']:<14} "
+                  f"{r.get('alpha_gen', float('nan')):<10.2f} "
+                  f"{r.get('alpha_real', float('nan')):<10.2f} "
+                  f"{r.get('beta_gen', float('nan')):<10.3f} "
+                  f"{r.get('beta_real', float('nan')):<10.3f}")
+    print(f"\nPaper reference (GBM+exp): α ≈ 4.62, β reported in Fig 5-8")
+    print(f"{'=' * 80}")
+
+    with open(os.path.join(save_dir, "grid_results.json"), "w") as f:
+        json.dump(all_results, f, indent=2, default=str)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="L4 GPU training for GBM Financial Diffusion"
+    )
+    parser.add_argument("--quick", action="store_true",
+                        help="Use reduced config (~30 min)")
+    parser.add_argument("--grid", action="store_true",
+                        help="Run full 3×3 experiment grid")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Resume from checkpoint path")
+    parser.add_argument("--sde_type", type=str, default=None,
+                        choices=["ve", "vp", "gbm"])
+    parser.add_argument("--schedule", type=str, default=None,
+                        choices=["linear", "exponential", "cosine"])
+    parser.add_argument("--save_dir", type=str, default="save/gbm_financial")
+    parser.add_argument("--use_synthetic", action="store_true")
+    args = parser.parse_args()
+
+    config = QUICK_CONFIG.copy() if args.quick else PAPER_CONFIG.copy()
+    if args.sde_type:
+        config["sde_type"] = args.sde_type
+    if args.schedule:
+        config["schedule"] = args.schedule
+    if args.use_synthetic:
+        config["use_synthetic"] = True
+
+    # Check GPU
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = torch.cuda.get_device_properties(0).total_mem / 1e9
+        print(f"GPU: {gpu_name} ({gpu_mem:.1f} GB)")
+    else:
+        print("WARNING: No GPU detected. Training will be very slow.")
+        if not args.quick:
+            print("Consider using --quick for CPU-only runs.")
+
+    # Ensure data
+    ensure_data(config)
+
+    # Run
+    if args.grid:
+        run_grid(config, args.save_dir)
+    else:
+        run_experiment(config, args.save_dir, resume_path=args.resume)
+
+
+if __name__ == "__main__":
+    main()
