@@ -72,7 +72,9 @@ PAPER_CONFIG = {
     "n_generate": 120,
 }
 
-# Reduced config for quick validation on L4 (~30 min)
+# Reduced config for quick validation on L4
+# Matches the proven config from CPU runs: window=256, stride=25, 1000 epochs
+# ~3500 gradient steps with single-stock CSV
 QUICK_CONFIG = {
     **PAPER_CONFIG,
     "channels": 64,
@@ -80,9 +82,9 @@ QUICK_CONFIG = {
     "feat_emb_dim": 32,
     "n_layers": 2,
     "n_heads": 4,
-    "seq_len": 512,
-    "window_len": 512,
-    "epochs": 500,
+    "seq_len": 256,
+    "window_len": 256,
+    "epochs": 1000,
     "n_reverse_steps": 500,
     "stride": 25,         # small stride → more windows from single-stock CSV
     "n_generate": 60,
@@ -273,6 +275,12 @@ def main():
                         choices=["linear", "exponential", "cosine"])
     parser.add_argument("--save_dir", type=str, default="save/gbm_financial")
     parser.add_argument("--use_synthetic", action="store_true")
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Override number of epochs")
+    parser.add_argument("--seq_len", type=int, default=None,
+                        help="Override sequence length")
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Override sliding window stride")
     args = parser.parse_args()
 
     config = QUICK_CONFIG.copy() if args.quick else PAPER_CONFIG.copy()
@@ -282,6 +290,13 @@ def main():
         config["schedule"] = args.schedule
     if args.use_synthetic:
         config["use_synthetic"] = True
+    if args.epochs:
+        config["epochs"] = args.epochs
+    if args.seq_len:
+        config["seq_len"] = args.seq_len
+        config["window_len"] = args.seq_len
+    if args.stride:
+        config["stride"] = args.stride
 
     # Check GPU
     if torch.cuda.is_available():
