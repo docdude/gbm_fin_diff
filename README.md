@@ -19,7 +19,7 @@ This model generates realistic synthetic financial time series by using a **Geom
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/gbm_fin_diff.git
+git clone https://github.com/docdude/gbm_fin_diff.git
 cd gbm_fin_diff
 
 # Install (CPU or GPU)
