@@ -28,6 +28,7 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 from .sde import get_sde, get_sigma
 from .score_network import FinancialScoreNetwork
@@ -260,6 +261,75 @@ class GBMFinancialDiffusion:
 
         return loss
 
+    def compute_loss_detailed(self, x_0, eps=1e-5):
+        """Compute loss with per-t and per-position diagnostics.
+
+        Returns dict with:
+          - loss: scalar (same as compute_loss)
+          - loss_by_t: {low, mid, high} — loss decomposed by diffusion time
+          - loss_by_pos: {early, mid, late} — loss decomposed by sequence position
+          - score_stats: {cos_sim, eps_pred_norm, eps_true_norm}
+        """
+        B, L = x_0.shape
+
+        t = torch.rand(B, device=self.device) * (self.sde.T - eps) + eps
+        z = torch.randn_like(x_0)
+        mean, std = self.sde.marginal_prob(x_0, t)
+        if std.dim() == 1:
+            x_t = mean + std.unsqueeze(-1) * z
+        else:
+            x_t = mean + std * z
+
+        eps_pred = self.model(x_t, t)
+        per_sample_pos = (z - eps_pred) ** 2  # (B, L)
+
+        if self.mask_anchor:
+            per_sample_pos = per_sample_pos.clone()
+            per_sample_pos[:, 0] = 0.0
+
+        # Overall loss
+        loss = per_sample_pos.mean()
+
+        # --- Loss by diffusion time t ---
+        per_sample = per_sample_pos.mean(dim=1)  # (B,)
+        t_np = t.detach().cpu().numpy()
+        ps = per_sample.detach().cpu().numpy()
+        low_mask = t_np < 0.33
+        mid_mask = (t_np >= 0.33) & (t_np < 0.67)
+        high_mask = t_np >= 0.67
+        loss_by_t = {
+            "low": float(ps[low_mask].mean()) if low_mask.any() else float('nan'),
+            "mid": float(ps[mid_mask].mean()) if mid_mask.any() else float('nan'),
+            "high": float(ps[high_mask].mean()) if high_mask.any() else float('nan'),
+        }
+
+        # --- Loss by sequence position ---
+        pos_losses = per_sample_pos.mean(dim=0).detach().cpu().numpy()  # (L,)
+        third = L // 3
+        loss_by_pos = {
+            "early": float(pos_losses[:third].mean()),
+            "mid": float(pos_losses[third:2*third].mean()),
+            "late": float(pos_losses[2*third:].mean()),
+        }
+
+        # --- Score / prediction statistics ---
+        with torch.no_grad():
+            flat_z = z.reshape(B, -1)
+            flat_pred = eps_pred.reshape(B, -1)
+            cos = torch.nn.functional.cosine_similarity(flat_z, flat_pred, dim=1)
+            score_stats = {
+                "cos_sim": float(cos.mean().cpu()),
+                "eps_pred_norm": float(flat_pred.norm(dim=1).mean().cpu()),
+                "eps_true_norm": float(flat_z.norm(dim=1).mean().cpu()),
+            }
+
+        return {
+            "loss": loss,
+            "loss_by_t": loss_by_t,
+            "loss_by_pos": loss_by_pos,
+            "score_stats": score_stats,
+        }
+
     def train(self, train_loader, val_loader=None, save_dir="save/gbm_financial"):
         """Train the score network.
 
@@ -272,6 +342,13 @@ class GBMFinancialDiffusion:
         config = self.config
         epochs = config["epochs"]
         best_val_loss = float("inf")
+
+        # TensorBoard
+        tb_dir = os.path.join(save_dir, "tb")
+        writer = SummaryWriter(log_dir=tb_dir)
+        print(f"  TensorBoard: {tb_dir}")
+        global_step = 0
+        diag_every = config.get("diag_every_epochs", 10)  # detailed diagnostics interval
 
         # Compute data statistics for standardization
         if self.normalize_data:
@@ -313,8 +390,8 @@ class GBMFinancialDiffusion:
                 loss = self.compute_loss(x_0)
                 loss.backward()
 
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # Gradient norm (before clipping)
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 self.optimizer.step()
 
@@ -324,23 +401,58 @@ class GBMFinancialDiffusion:
 
                 epoch_loss += loss.item()
                 n_batches += 1
+                global_step += 1
                 pbar.set_postfix(loss=f"{epoch_loss / n_batches:.6f}")
+
+                # Per-step logging (lightweight)
+                writer.add_scalar("loss/train_step", loss.item(), global_step)
+                writer.add_scalar("grad/norm", grad_norm, global_step)
 
             self.scheduler.step()
             avg_loss = epoch_loss / max(n_batches, 1)
+            lr = self.optimizer.param_groups[0]["lr"]
+
+            # Per-epoch logging
+            writer.add_scalar("loss/train", avg_loss, epoch + 1)
+            writer.add_scalar("lr", lr, epoch + 1)
 
             # Validation
             val_loss_str = ""
             if val_loader is not None and (epoch + 1) % 20 == 0:
                 val_loss = self._validate(val_loader)
                 val_loss_str = f", val_loss={val_loss:.4e}"
+                writer.add_scalar("loss/val", val_loss, epoch + 1)
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     self.save(os.path.join(save_dir, "best_model.pth"))
 
+            # Detailed diagnostics (loss by t, by position, score stats)
+            if (epoch + 1) % diag_every == 0 or epoch == 0:
+                self.model.eval()
+                with torch.no_grad():
+                    diag_batch = next(iter(train_loader)).to(self.device)
+                    if self.normalize_data:
+                        diag_batch = (diag_batch - self.data_mean) / self.data_std
+                    diag = self.compute_loss_detailed(diag_batch)
+                self.model.train()
+
+                for band, val in diag["loss_by_t"].items():
+                    writer.add_scalar(f"loss_by_t/{band}", val, epoch + 1)
+                for region, val in diag["loss_by_pos"].items():
+                    writer.add_scalar(f"loss_by_pos/{region}", val, epoch + 1)
+                for stat, val in diag["score_stats"].items():
+                    writer.add_scalar(f"score/{stat}", val, epoch + 1)
+
+                # EMA val loss (compare with non-EMA)
+                if self.use_ema and val_loader is not None and (epoch + 1) % 20 == 0:
+                    self.ema.apply_shadow()
+                    ema_val = self._validate(val_loader)
+                    self.ema.restore()
+                    writer.add_scalar("loss/val_ema", ema_val, epoch + 1)
+                    writer.add_scalar("ema/gap", val_loss - ema_val, epoch + 1)
+
             # Log every 10 epochs
             if (epoch + 1) % 10 == 0 or epoch == 0:
-                lr = self.optimizer.param_groups[0]["lr"]
                 print(f"  Epoch {epoch + 1:4d}/{epochs}: loss={avg_loss:.4e}, lr={lr:.2e}{val_loss_str}")
 
             # Save checkpoint periodically
@@ -349,7 +461,9 @@ class GBMFinancialDiffusion:
 
         # Final save
         self.save(os.path.join(save_dir, "final_model.pth"))
+        writer.close()
         print(f"\nTraining complete. Models saved to {save_dir}")
+        print(f"TensorBoard logs: tensorboard --logdir {tb_dir}")
 
     def _validate(self, val_loader):
         self.model.eval()
