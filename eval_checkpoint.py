@@ -17,8 +17,8 @@ from gbm_financial.metrics import (compute_pathwise_diagnostics,
 
 # ── Config ──────────────────────────────────────────────────────────────
 CHECKPOINT = "save/gbm_financial/best_model(1).pth"
-N_GENERATE = 20           # fewer for CPU speed
-N_REVERSE = 500           # fewer steps for CPU (still reasonable quality)
+N_GENERATE = 60           # enough for stable statistics
+N_REVERSE = 2000          # paper's full reverse steps (no extra VRAM cost)
 SAVE_DIR = "save/gbm_financial/eval_paper_600"
 
 # ── Load real data ──────────────────────────────────────────────────────
@@ -56,13 +56,13 @@ config_gen = dict(config)
 config_gen["n_reverse_steps"] = N_REVERSE
 config_gen["n_generate"] = N_GENERATE
 
-device = torch.device("cpu")  # local GPU incompatible, use CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = GBMFinancialDiffusion(config_gen, device=device)
 model.load(CHECKPOINT)
 print("Checkpoint loaded.")
 
 # ── Generate ────────────────────────────────────────────────────────────
-generated = model.generate(n_samples=N_GENERATE, batch_size=5)
+generated = model.generate(n_samples=N_GENERATE, batch_size=10)
 os.makedirs(SAVE_DIR, exist_ok=True)
 np.save(os.path.join(SAVE_DIR, "generated_data.npy"), generated)
 

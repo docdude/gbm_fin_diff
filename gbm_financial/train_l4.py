@@ -45,7 +45,7 @@ PAPER_CONFIG = {
     "sde_type": "gbm",
     "schedule": "exponential",
     "sigma_min": 0.01,
-    "sigma_max": "auto",   # Auto-computed from data (≈ 3× data range)
+    "sigma_max": 1.0,      # Paper Section 4: σ_max = 1.0
     "n_reverse_steps": 2000,
 
     # Architecture (Section 3.1.1)

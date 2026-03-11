@@ -1,18 +1,18 @@
 {
   "sde_type": "gbm",
   "schedule": "exponential",
-  "alpha_gen": 4.9326121449567175,
-  "alpha_real": 5.912303314135128,
-  "beta_gen": 0.16424930476010483,
-  "beta_real": 0.3254635258200618,
+  "alpha_gen": 7.2144297918530285,
+  "alpha_real": 6.170889167446432,
+  "beta_gen": 0.5391662808781847,
+  "beta_real": 0.3031135649736212,
   "n_train": 5056,
   "n_stocks": 105,
-  "train_time_hours": 4.288610220683945,
+  "train_time_hours": 4.2902578741312025,
   "config": {
     "sde_type": "gbm",
     "schedule": "exponential",
     "sigma_min": 0.01,
-    "sigma_max": 1.0,
+    "sigma_max": 9.942481384277343,
     "n_reverse_steps": 1000,
     "channels": 64,
     "diff_emb_dim": 128,
@@ -31,6 +31,7 @@
     "stride": 200,
     "min_years": 40,
     "use_synthetic": false,
-    "n_generate": 60
+    "n_generate": 60,
+    "normalize_data": false
   }
 }
