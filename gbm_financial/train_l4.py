@@ -45,7 +45,7 @@ PAPER_CONFIG = {
     "sde_type": "gbm",
     "schedule": "exponential",
     "sigma_min": 0.01,
-    "sigma_max": 1.0,      # Paper Section 4: σ_max = 1.0
+    "sigma_max": "auto",   # Auto-computed from data (≈ 3× data range ≈ 8.35)
     "n_reverse_steps": 2000,
 
     # Architecture (Section 3.1.1)
@@ -209,13 +209,14 @@ def run_experiment(config, save_dir, resume_path=None):
     generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
     np.save(os.path.join(exp_dir, "generated_data.npy"), generated)
 
-    # Get real data for comparison
+    # Get ALL real data for comparison (not just n_gen samples)
+    # Hill estimator is highly sample-size sensitive:
+    #   120 samples → α ≈ 6.5,  2551 samples → α ≈ 9.95
+    # Using a small subset artificially deflates α_real to match α_gen.
     real_data = []
     for batch in train_loader:
         real_data.append(batch.numpy())
-        if sum(len(b) for b in real_data) >= n_gen:
-            break
-    real_data = np.concatenate(real_data, axis=0)[:n_gen]
+    real_data = np.concatenate(real_data, axis=0)
 
     # Evaluate
     gen_results, real_results = model.evaluate(generated, real_data, save_dir=exp_dir)
