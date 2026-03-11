@@ -178,9 +178,25 @@ class GBMFinancialDiffusion:
         # return distributions are roughly stationary and have no drift.
         self.data_mean = 0.0
         self.data_std = 1.0
-        # Default: off for GBM (log-price paths), on for VE/VP (returns)
+        # Per-path stats for per_path normalization mode
+        self.path_means = None  # (N_train,) array
+        self.path_stds = None   # (N_train,) array
+
+        # Normalization mode: "none", "global", "per_path"
+        # - none: raw data (default for GBM/log_price)
+        # - global: single (mean, std) across all data (legacy normalize_data=True)
+        # - per_path: each window normalized independently; empirical (μ,σ) stored
+        #   for denormalization at generation time
         default_normalize = self.data_mode != "log_price"
-        self.normalize_data = config.get("normalize_data", default_normalize)
+        # Support both old normalize_data bool and new normalize_mode string
+        if "normalize_mode" in config:
+            self.normalize_mode = config["normalize_mode"]
+        elif config.get("normalize_data", default_normalize):
+            self.normalize_mode = "global"
+        else:
+            self.normalize_mode = "none"
+        # Legacy compat
+        self.normalize_data = self.normalize_mode == "global"
 
         # Anchor-zero masking: when data_mode='log_price', each subsequence is
         # anchored at 0 via window - window[0].  The first timestep is always
@@ -351,7 +367,7 @@ class GBMFinancialDiffusion:
         diag_every = config.get("diag_every_epochs", 10)  # detailed diagnostics interval
 
         # Compute data statistics for standardization
-        if self.normalize_data:
+        if self.normalize_mode == "global":
             all_data = []
             for batch in train_loader:
                 all_data.append(batch)
@@ -360,17 +376,27 @@ class GBMFinancialDiffusion:
             self.data_std = all_data.std().item()
             if self.data_std < 1e-8:
                 self.data_std = 1.0
-            print(f"  Data standardization: mean={self.data_mean:.4f}, std={self.data_std:.4f}")
+            print(f"  Data standardization (global): mean={self.data_mean:.4f}, std={self.data_std:.4f}")
+        elif self.normalize_mode == "per_path":
+            all_data = []
+            for batch in train_loader:
+                all_data.append(batch)
+            all_data = torch.cat(all_data, dim=0)  # (N, L)
+            self.path_means = all_data.mean(dim=-1).numpy()  # (N,)
+            self.path_stds = all_data.std(dim=-1).numpy()    # (N,)
+            self.path_stds = np.clip(self.path_stds, 1e-8, None)
+            print(f"  Data standardization (per-path): {len(self.path_means)} windows")
+            print(f"    mu: [{self.path_means.min():.3f}, {self.path_means.max():.3f}], "
+                  f"mean={self.path_means.mean():.3f}")
+            print(f"    sigma: [{self.path_stds.min():.3f}, {self.path_stds.max():.3f}], "
+                  f"mean={self.path_stds.mean():.3f}")
 
         print(f"\nTraining: SDE={config['sde_type']}, schedule={config['schedule']}")
         print(f"  epochs={epochs}, batch_size={config['batch_size']}, lr={config['lr']}")
         print(f"  σ_min={config['sigma_min']}, σ_max={config['sigma_max']}")
         print(f"  device={self.device}")
         print(f"  data mode={self.data_mode}")
-        if self.normalize_data:
-            print(f"  data normalization: ON (mean={self.data_mean:.4f}, std={self.data_std:.4f})")
-        else:
-            print(f"  data normalization: OFF")
+        print(f"  normalization: {self.normalize_mode}")
 
         for epoch in range(epochs):
             self.model.train()
@@ -383,8 +409,13 @@ class GBMFinancialDiffusion:
                 x_0 = batch.to(self.device)  # (B, L)
 
                 # Standardize if enabled
-                if self.normalize_data:
+                if self.normalize_mode == "global":
                     x_0 = (x_0 - self.data_mean) / self.data_std
+                elif self.normalize_mode == "per_path":
+                    # Per-path z-score: each sample normalized independently
+                    mu = x_0.mean(dim=-1, keepdim=True)
+                    sigma = x_0.std(dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_0 = (x_0 - mu) / sigma
 
                 self.optimizer.zero_grad()
                 loss = self.compute_loss(x_0)
@@ -431,8 +462,12 @@ class GBMFinancialDiffusion:
                 self.model.eval()
                 with torch.no_grad():
                     diag_batch = next(iter(train_loader)).to(self.device)
-                    if self.normalize_data:
+                    if self.normalize_mode == "global":
                         diag_batch = (diag_batch - self.data_mean) / self.data_std
+                    elif self.normalize_mode == "per_path":
+                        mu = diag_batch.mean(dim=-1, keepdim=True)
+                        sigma = diag_batch.std(dim=-1, keepdim=True).clamp(min=1e-8)
+                        diag_batch = (diag_batch - mu) / sigma
                     diag = self.compute_loss_detailed(diag_batch)
                 self.model.train()
 
@@ -566,8 +601,15 @@ class GBMFinancialDiffusion:
         samples = np.concatenate(all_samples, axis=0)[:n_samples]
 
         # Denormalize back to original data scale
-        if self.normalize_data:
+        if self.normalize_mode == "global":
             samples = samples * self.data_std + self.data_mean
+        elif self.normalize_mode == "per_path" and self.path_means is not None:
+            # Sample (μ, σ) from empirical distribution of training paths
+            indices = np.random.randint(0, len(self.path_means), size=samples.shape[0])
+            mu = self.path_means[indices]    # (n_samples,)
+            sigma = self.path_stds[indices]  # (n_samples,)
+            samples = samples * sigma[:, None] + mu[:, None]
+            print(f"  Per-path denorm: sampled {samples.shape[0]} (mu, sigma) pairs")
 
         print(f"Generated {samples.shape[0]} samples of length {samples.shape[1]}")
 
@@ -649,8 +691,13 @@ class GBMFinancialDiffusion:
         samples = np.concatenate(all_samples, axis=0)[:n_samples]
 
         # Denormalize
-        if self.normalize_data:
+        if self.normalize_mode == "global":
             samples = samples * self.data_std + self.data_mean
+        elif self.normalize_mode == "per_path" and self.path_means is not None:
+            indices = np.random.randint(0, len(self.path_means), size=samples.shape[0])
+            mu = self.path_means[indices]
+            sigma = self.path_stds[indices]
+            samples = samples * sigma[:, None] + mu[:, None]
 
         print(f"Generated {samples.shape[0]} samples (ODE)")
 
@@ -711,14 +758,18 @@ class GBMFinancialDiffusion:
             "config": self.config,
             "data_mean": self.data_mean,
             "data_std": self.data_std,
+            "normalize_mode": self.normalize_mode,
         }
+        if self.path_means is not None:
+            checkpoint["path_means"] = self.path_means
+            checkpoint["path_stds"] = self.path_stds
         if self.use_ema:
             checkpoint["ema_state_dict"] = self.ema.state_dict()
         torch.save(checkpoint, path)
 
     def load(self, path):
         """Load model checkpoint (restores EMA state if present)."""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint["model_state_dict"])
         if "optimizer_state_dict" in checkpoint:
             try:
@@ -733,4 +784,9 @@ class GBMFinancialDiffusion:
             self.data_mean = checkpoint["data_mean"]
             self.data_std = checkpoint["data_std"]
             print(f"  Data norm: mean={self.data_mean:.4f}, std={self.data_std:.4f}")
+        if "path_means" in checkpoint:
+            self.path_means = checkpoint["path_means"]
+            self.path_stds = checkpoint["path_stds"]
+            self.normalize_mode = checkpoint.get("normalize_mode", "per_path")
+            print(f"  Per-path stats restored: {len(self.path_means)} windows")
         print(f"Loaded checkpoint from {path}")

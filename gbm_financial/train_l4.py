@@ -328,6 +328,11 @@ def main():
                         help="Override sequence length")
     parser.add_argument("--stride", type=int, default=None,
                         help="Override sliding window stride")
+    parser.add_argument("--zscore", type=str, default=None,
+                        choices=["none", "global", "per_path"],
+                        help="Normalization mode: none, global, per_path")
+    parser.add_argument("--sigma_max", type=str, default=None,
+                        help="Override sigma_max (number or 'auto')")
     args = parser.parse_args()
 
     if args.minimal:
@@ -349,6 +354,13 @@ def main():
         config["window_len"] = args.seq_len
     if args.stride:
         config["stride"] = args.stride
+    if args.zscore:
+        config["normalize_mode"] = args.zscore
+    if args.sigma_max:
+        try:
+            config["sigma_max"] = float(args.sigma_max)
+        except ValueError:
+            config["sigma_max"] = args.sigma_max  # "auto"
 
     # Check GPU
     if torch.cuda.is_available():
