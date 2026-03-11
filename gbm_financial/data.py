@@ -338,9 +338,15 @@ def get_dataloaders(sde_type="gbm", window_len=2048, stride=400, batch_size=64,
     Returns:
         train_loader, val_loader, data_info dict
     """
-    # Get raw price data — priority: CSV > yfinance download > synthetic
+    # Get raw price data — priority: pkl cache > CSV > yfinance download > synthetic
+    cache_file = os.path.join(cache_dir, "sp500_prices.pkl")
     if use_synthetic:
         stock_data = generate_synthetic_gbm_data(n_sequences=100, seq_len=window_len + 500)
+    elif os.path.exists(cache_file):
+        # Prefer multi-stock pkl cache (105 stocks, ~5000 windows)
+        print(f"Loading multi-stock cache: {cache_file}")
+        with open(cache_file, "rb") as f:
+            stock_data = pickle.load(f)
     elif os.path.exists(csv_path):
         stock_data = load_csv_data(csv_path)
         if len(stock_data) == 0:
