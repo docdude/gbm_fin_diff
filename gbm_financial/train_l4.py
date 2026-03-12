@@ -247,6 +247,20 @@ def run_experiment(config, save_dir, resume_path=None):
         "train_time_hours": train_time / 3600,
         "config": {k: v for k, v in config.items()
                    if isinstance(v, (int, float, str, bool))},
+        # Effective training parameters (includes derived/defaulted values)
+        "training_params": {
+            "data_mode": model.data_mode,
+            "mask_anchor": model.mask_anchor,
+            "normalize_mode": model.normalize_mode,
+            "data_mean": model.data_mean,
+            "data_std": model.data_std,
+            "use_ema": model.use_ema,
+            "likelihood_weighting": model.use_likelihood_weighting,
+            "n_model_params": sum(p.numel() for p in model.model.parameters()),
+            "total_gradient_steps": config["epochs"] * n_batches,
+            "n_batches_per_epoch": n_batches,
+            "device": str(model.device),
+        },
     }
 
     with open(os.path.join(exp_dir, "results.json"), "w") as f:
@@ -333,6 +347,10 @@ def main():
                         help="Normalization mode: none, global, per_path")
     parser.add_argument("--sigma_max", type=str, default=None,
                         help="Override sigma_max (number or 'auto')")
+    parser.add_argument("--no-anchor", action="store_true",
+                        help="Disable anchor masking (include pos 0 in loss)")
+    parser.add_argument("--n-reverse", type=int, default=None,
+                        help="Override number of reverse SDE steps for generation")
     args = parser.parse_args()
 
     if args.minimal:
@@ -356,6 +374,10 @@ def main():
         config["stride"] = args.stride
     if args.zscore:
         config["normalize_mode"] = args.zscore
+    if args.no_anchor:
+        config["mask_anchor"] = False
+    if args.n_reverse:
+        config["n_reverse_steps"] = args.n_reverse
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)
