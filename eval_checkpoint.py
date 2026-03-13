@@ -1,79 +1,53 @@
 #!/usr/bin/env python3
-"""Evaluate a checkpoint mid-training: generate samples & compute pathwise metrics."""
+"""Evaluate a checkpoint: generate samples with selectable sampler & compute metrics.
 
+Supports PC (Langevin), EM, and ODE samplers. Designed to run against a
+best_model.pth while training is still in progress.
+
+Usage:
+    # PC sampler (default, matches score_sde VE):
+    python eval_checkpoint.py --checkpoint save/gbm_financial_langevin/gbm_exponential/best_model.pth
+
+    # Predictor-only (no Langevin corrector):
+    python eval_checkpoint.py --checkpoint ... --corrector-steps 0
+
+    # EM sampler (legacy):
+    python eval_checkpoint.py --checkpoint ... --sampler em
+
+    # Sweep SNR values:
+    python eval_checkpoint.py --checkpoint ... --snr 0.05
+
+    # Custom output dir:
+    python eval_checkpoint.py --checkpoint ... --save-dir save/eval_run1
+"""
+
+import argparse
 import sys
 import os
+import json
 import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(__file__))
 
 from gbm_financial.train import GBMFinancialDiffusion
-from gbm_financial.train_l4 import PAPER_CONFIG
 from gbm_financial.data import get_dataloaders, compute_sigma_max
 from gbm_financial.metrics import (compute_pathwise_diagnostics,
                                    print_pathwise_summary,
-                                   compute_log_returns)
+                                   compute_log_returns,
+                                   evaluate_stylized_facts,
+                                   plot_stylized_facts,
+                                   plot_diagnostics,
+                                   plot_pathwise_diagnostics,
+                                   plot_mean_path_diagnostic)
 
-# ── Config ──────────────────────────────────────────────────────────────
-CHECKPOINT = "save/gbm_financial/best_model(1).pth"
-N_GENERATE = 60           # enough for stable statistics
-N_REVERSE = 2000          # paper's full reverse steps (no extra VRAM cost)
-SAVE_DIR = "save/gbm_financial/eval_paper_600"
 
-# ── Load real data ──────────────────────────────────────────────────────
-config = dict(PAPER_CONFIG)
-
-print("Loading data...")
-# Use a non-existent CSV path so it falls through to pkl cache
-train_loader, val_loader, dataset_info = get_dataloaders(
-    csv_path="data/sp500_SKIP.csv",          # skip CSV, use pkl cache
-    cache_dir="/opt/CSDI/data/financial",     # where the 105-ticker pkl lives
-    window_len=config["window_len"],
-    stride=config["stride"],
-    batch_size=config["batch_size"],
-    sde_type="gbm",
-    min_years=config["min_years"],
-)
-
-# Auto σ_max
-sigma_max, _ = compute_sigma_max(train_loader)
-config["sigma_max"] = sigma_max
-print(f"σ_max (auto) = {sigma_max:.2f}")
-
-# Gather real data for comparison
-real_data = []
-for batch in train_loader:
-    real_data.append(batch.numpy())
-for batch in val_loader:
-    real_data.append(batch.numpy())
-real_data = np.concatenate(real_data, axis=0)
-print(f"Real data: {real_data.shape}")
-
-# ── Load model ──────────────────────────────────────────────────────────
-print(f"\nLoading checkpoint: {CHECKPOINT}")
-config_gen = dict(config)
-config_gen["n_reverse_steps"] = N_REVERSE
-config_gen["n_generate"] = N_GENERATE
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = GBMFinancialDiffusion(config_gen, device=device)
-model.load(CHECKPOINT)
-print("Checkpoint loaded.")
-
-# ── Generate ────────────────────────────────────────────────────────────
-generated = model.generate(n_samples=N_GENERATE, batch_size=10)
-os.makedirs(SAVE_DIR, exist_ok=True)
-np.save(os.path.join(SAVE_DIR, "generated_data.npy"), generated)
-
-# ── Quick scalar metrics (return AC, path std, endpoints) ───────────────
 def quick_scalar_comparison(gen, real, label=""):
-    """Compute the key scalar metrics we tracked in the QUICK run."""
+    """Key scalar metrics for quick comparison."""
     ret_r = compute_log_returns(real, mode="log_price")
     ret_g = compute_log_returns(gen, mode="log_price")
 
     def ac1(r):
-        """Return AC(1) across all paths."""
         acs = []
         for i in range(r.shape[0]):
             if r.shape[1] > 1:
@@ -116,22 +90,152 @@ def quick_scalar_comparison(gen, real, label=""):
         print(f"{name:<25} {r:>12.4f} {g:>12.4f} {ratio:>8.2f} {status:>8}")
     return metrics
 
-paper_metrics = quick_scalar_comparison(generated, real_data, "(PAPER @ ~epoch 600)")
 
-# ── Full pathwise diagnostics ────────────────────────────────────────
-gen_pw = compute_pathwise_diagnostics(generated, mode="log_price")
-real_pw = compute_pathwise_diagnostics(real_data, mode="log_price")
-print_pathwise_summary(gen_pw, real_pw)
+def main():
+    parser = argparse.ArgumentParser(description="Evaluate checkpoint with selectable sampler")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to best_model.pth or checkpoint_epochN.pth")
+    parser.add_argument("--save-dir", type=str, default=None,
+                        help="Output directory (default: alongside checkpoint)")
+    parser.add_argument("--sampler", type=str, default="pc",
+                        choices=["pc", "em", "ode"],
+                        help="Sampling method: pc (Langevin), em (Euler-Maruyama), ode")
+    parser.add_argument("--n-generate", type=int, default=60)
+    parser.add_argument("--n-reverse", type=int, default=2000)
+    parser.add_argument("--snr", type=float, default=0.16,
+                        help="Langevin corrector SNR (PC sampler only)")
+    parser.add_argument("--corrector-steps", type=int, default=1,
+                        help="Langevin corrector steps per predictor step (0 = predictor-only)")
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--stride", type=int, default=None,
+                        help="Override data stride (default: from checkpoint config)")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="Skip generating plot files")
+    args = parser.parse_args()
 
-# ── Compare against QUICK_CONFIG results ─────────────────────────────
-quick_gen_path = "save/gbm_financial/generated_data.npy"
-if os.path.exists(quick_gen_path):
-    quick_gen = np.load(quick_gen_path)
-    print(f"\n{'='*70}")
-    print("QUICK vs PAPER — key scalar metrics")
-    print(f"{'='*70}")
-    quick_scalar_comparison(quick_gen, real_data, "(QUICK)")
+    # Resolve save dir
+    if args.save_dir is None:
+        ckpt_dir = os.path.dirname(args.checkpoint)
+        suffix = args.sampler
+        if args.sampler == "pc" and args.corrector_steps == 0:
+            suffix = "pc_pred_only"
+        elif args.sampler == "pc":
+            suffix = f"pc_snr{args.snr}"
+        args.save_dir = os.path.join(ckpt_dir, f"eval_{suffix}")
+    os.makedirs(args.save_dir, exist_ok=True)
 
-# ── Evaluate (plots + stylized facts) ──────────────────────────────────
-model.evaluate(generated, real_data, save_dir=SAVE_DIR)
-print(f"\nPlots saved to {SAVE_DIR}/")
+    # Try to load config from results.json next to checkpoint, else from checkpoint
+    ckpt_dir = os.path.dirname(args.checkpoint)
+    results_json = os.path.join(ckpt_dir, "results.json")
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+    if os.path.exists(results_json):
+        with open(results_json) as f:
+            config = json.load(f).get("config", {})
+        print(f"Config from {results_json}")
+    elif "config" in ckpt:
+        config = ckpt["config"]
+        print(f"Config from checkpoint")
+    else:
+        print("ERROR: No config found in results.json or checkpoint")
+        sys.exit(1)
+
+    # Override sampling params
+    config["n_reverse_steps"] = args.n_reverse
+    config["pc_snr"] = args.snr
+    config["pc_corrector_steps"] = args.corrector_steps
+
+    # Ensure sigma_max is numeric
+    if config.get("sigma_max") == "auto" or not isinstance(config.get("sigma_max"), (int, float)):
+        config["sigma_max"] = 10.0  # placeholder, will be overridden below
+
+    # Load data
+    print("Loading data...")
+    stride = args.stride or config.get("stride", 400)
+    window_len = config.get("seq_len", config.get("window_len", 2048))
+
+    train_loader, val_loader, dataset_info = get_dataloaders(
+        sde_type=config.get("sde_type", "gbm"),
+        window_len=window_len,
+        stride=stride,
+        batch_size=config.get("batch_size", 64),
+        min_years=config.get("min_years", 40),
+        num_workers=2,
+    )
+
+    # Auto σ_max from data
+    sigma_max, _ = compute_sigma_max(train_loader)
+    config["sigma_max"] = sigma_max
+    print(f"σ_max (auto) = {sigma_max:.2f}")
+
+    # Gather real data
+    real_data = np.concatenate([b.numpy() for b in train_loader], axis=0)
+    print(f"Real data: {real_data.shape}")
+
+    # Load model
+    print(f"\nLoading checkpoint: {args.checkpoint}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = GBMFinancialDiffusion(config, device=device)
+    model.load(args.checkpoint)
+    print("Checkpoint loaded.")
+
+    # Generate
+    sampler_label = args.sampler.upper()
+    if args.sampler == "pc":
+        if args.corrector_steps == 0:
+            sampler_label = "PC (predictor-only)"
+        else:
+            sampler_label = f"PC (snr={args.snr}, corr_steps={args.corrector_steps})"
+        generated = model.generate(n_samples=args.n_generate,
+                                   seq_len=window_len,
+                                   batch_size=args.batch_size)
+    elif args.sampler == "em":
+        generated = model.generate_em(n_samples=args.n_generate,
+                                      seq_len=window_len,
+                                      batch_size=args.batch_size)
+    elif args.sampler == "ode":
+        generated = model.generate_ode(n_samples=args.n_generate,
+                                       seq_len=window_len,
+                                       batch_size=args.batch_size)
+
+    np.save(os.path.join(args.save_dir, "generated_data.npy"), generated)
+
+    # Scalar metrics
+    scalar_metrics = quick_scalar_comparison(generated, real_data, f"({sampler_label})")
+
+    # Pathwise diagnostics
+    gen_pw = compute_pathwise_diagnostics(generated, mode="log_price")
+    real_pw = compute_pathwise_diagnostics(real_data, mode="log_price")
+    print_pathwise_summary(gen_pw, real_pw)
+
+    # Stylized facts + plots
+    model.evaluate(generated, real_data, save_dir=args.save_dir)
+
+    if not args.no_plots:
+        mode = "log_price" if config.get("sde_type") == "gbm" else "log_return"
+        plot_diagnostics(generated, real_data, mode=mode,
+                         save_path=os.path.join(args.save_dir, "diagnostics.png"))
+        plot_pathwise_diagnostics(generated, real_data, mode=mode,
+                                  save_path=os.path.join(args.save_dir, "pathwise_diagnostics.png"))
+        plot_mean_path_diagnostic(generated, real_data, mode=mode,
+                                   save_path=os.path.join(args.save_dir, "mean_path_diagnostic.png"))
+
+    # Save eval metadata
+    eval_meta = {
+        "checkpoint": args.checkpoint,
+        "sampler": args.sampler,
+        "n_reverse": args.n_reverse,
+        "snr": args.snr,
+        "corrector_steps": args.corrector_steps,
+        "n_generate": args.n_generate,
+        "sigma_max": sigma_max,
+        "n_real": real_data.shape[0],
+    }
+    with open(os.path.join(args.save_dir, "eval_meta.json"), "w") as f:
+        json.dump(eval_meta, f, indent=2)
+
+    print(f"\nResults saved to {args.save_dir}/")
+
+
+if __name__ == "__main__":
+    main()
