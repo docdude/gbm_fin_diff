@@ -204,6 +204,14 @@ def run_experiment(config, save_dir, resume_path=None):
     train_time = time.time() - start
     print(f"Training time: {train_time / 3600:.1f} hours")
 
+    # Reload best model for evaluation (training ends at final epoch, not best)
+    best_path = os.path.join(exp_dir, "best_model.pth")
+    if os.path.exists(best_path):
+        model.load(best_path)
+        print(f"Loaded best model from {best_path}")
+    else:
+        print("WARNING: No best_model.pth found, evaluating final epoch model")
+
     # Generate
     n_gen = config.get("n_generate", 120)
     generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
