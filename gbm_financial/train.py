@@ -30,7 +30,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-from .sde import get_sde, get_sigma
+from .sde import get_sde, get_sigma, _expand
 from .score_network import FinancialScoreNetwork
 from .metrics import (evaluate_stylized_facts, plot_stylized_facts,
                       plot_diagnostics, plot_pathwise_diagnostics,
@@ -54,9 +54,11 @@ class EMA:
         ema.restore()        # swap back training weights
     """
 
-    def __init__(self, model, decay=0.999):
+    def __init__(self, model, decay=0.999, use_num_updates=True):
         self.model = model
         self.decay = decay
+        self.use_num_updates = use_num_updates
+        self.num_updates = 0
         self.shadow = {}
         self.backup = {}
         # Initialize shadow params as copies of current params
@@ -65,11 +67,22 @@ class EMA:
                 self.shadow[name] = param.data.clone()
 
     def update(self):
-        """Update shadow parameters after an optimizer step."""
+        """Update shadow parameters after an optimizer step.
+
+        When use_num_updates=True, ramps decay from ~0.1 to target over
+        the first ~9000 steps.  This prevents the EMA from being polluted
+        by random initial weights (matches score_sde_pytorch).
+        """
+        if self.use_num_updates:
+            self.num_updates += 1
+            decay = min(self.decay,
+                        (1 + self.num_updates) / (10 + self.num_updates))
+        else:
+            decay = self.decay
         for name, param in self.model.named_parameters():
             if param.requires_grad:
-                self.shadow[name].mul_(self.decay).add_(
-                    param.data, alpha=1.0 - self.decay
+                self.shadow[name].mul_(decay).add_(
+                    param.data, alpha=1.0 - decay
                 )
 
     def apply_shadow(self):
@@ -87,10 +100,21 @@ class EMA:
         self.backup = {}
 
     def state_dict(self):
-        return {name: tensor.clone() for name, tensor in self.shadow.items()}
+        return {
+            'shadow': {name: tensor.clone() for name, tensor in self.shadow.items()},
+            'num_updates': self.num_updates,
+        }
 
     def load_state_dict(self, state_dict):
-        self.shadow = {name: tensor.clone() for name, tensor in state_dict.items()}
+        # Backward compat: old checkpoints store shadow params directly
+        if isinstance(state_dict, dict) and 'shadow' in state_dict:
+            self.shadow = {name: tensor.clone()
+                           for name, tensor in state_dict['shadow'].items()}
+            self.num_updates = state_dict.get('num_updates', 0)
+        else:
+            self.shadow = {name: tensor.clone()
+                           for name, tensor in state_dict.items()}
+            self.num_updates = 0
 
 
 class GBMFinancialDiffusion:
@@ -514,24 +538,126 @@ class GBMFinancialDiffusion:
 
     @torch.no_grad()
     def generate(self, n_samples=120, seq_len=None, batch_size=None):
-        """Generate synthetic financial time series via reverse SDE.
+        """Generate via Predictor-Corrector sampling (score_sde VE default).
 
-        Uses Euler-Maruyama integration of the reverse-time SDE:
-            dX = -g²(t) * score(X, t) dt + g(t) dW̄
+        Predictor: ReverseDiffusion — exact discrete σ² steps via sde.discretize()
+        Corrector: Langevin MCMC — adaptive step size with target SNR
 
-        With noise prediction: score = -ε_θ / σ_t
+        This matches score_sde_pytorch's default VE sampler:
+          predictor = reverse_diffusion
+          corrector = langevin
+          snr = 0.16, n_steps_each = 1, noise_removal = True
 
-        Paper settings: N=2000 reverse steps, T=1.
-        Uses EMA weights if available (better sample quality).
-
-        Args:
-            n_samples: number of sequences to generate (paper: 120)
-            seq_len: sequence length (default from config: 2048)
-            batch_size: generation batch size
-        Returns:
-            numpy array of shape (n_samples, seq_len)
+        Score_sde PC loop (Song et al. 2021 Algorithm 1):
+          for i in 0..N-1:
+            x, x_mean = corrector(x, t_i)    # Langevin refinement
+            x, x_mean = predictor(x, t_i)    # Reverse diffusion step
+          return x_mean                      # noise removal
         """
-        # Swap in EMA weights for generation (higher quality)
+        if self.use_ema:
+            self.ema.apply_shadow()
+
+        self.model.eval()
+        seq_len = seq_len or self.config["seq_len"]
+        batch_size = batch_size or min(n_samples, 32)
+        N = self.config["n_reverse_steps"]  # = sde.N
+        T = self.sde.T
+        eps = 1e-5  # score_sde VE default (not 1e-3)
+
+        # PC sampler parameters (score_sde VE defaults)
+        snr = self.config.get("pc_snr", 0.16)
+        n_corrector_steps = self.config.get("pc_corrector_steps", 1)
+
+        all_samples = []
+        n_remaining = n_samples
+        nfe = N * (n_corrector_steps + 1)
+
+        print(f"\nGenerating {n_samples} samples "
+              f"(PC sampler, N={N}, snr={snr}, NFE={nfe})...")
+
+        # Pre-move discrete sigmas to device once
+        discrete_sigmas = self.sde.discrete_sigmas.to(self.device)
+
+        while n_remaining > 0:
+            B = min(batch_size, n_remaining)
+            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            timesteps = torch.linspace(T, eps, N, device=self.device)
+
+            for i in tqdm(range(N), desc="PC sampling", leave=False,
+                          mininterval=2.0):
+                t_curr = timesteps[i]
+                t_batch = torch.full((B,), t_curr, device=self.device)
+
+                # === Corrector: Langevin MCMC ===
+                for _ in range(n_corrector_steps):
+                    eps_pred = self.model(x, t_batch)
+                    _, std = self.sde.marginal_prob(x, t_batch)
+                    score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
+
+                    noise = torch.randn_like(x)
+                    grad_norm = torch.norm(
+                        score.reshape(B, -1), dim=-1).mean()
+                    noise_norm = torch.norm(
+                        noise.reshape(B, -1), dim=-1).mean()
+                    # VE: alpha = 1.0 (no scaling)
+                    step_size = (snr * noise_norm / grad_norm) ** 2 * 2
+                    x_mean = x + step_size * score
+                    x = x_mean + torch.sqrt(step_size * 2) * noise
+
+                # === Predictor: Reverse Diffusion ===
+                eps_pred = self.model(x, t_batch)
+                _, std = self.sde.marginal_prob(x, t_batch)
+                score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
+
+                # Discrete VE sigma steps (SMLD discretization)
+                idx = int(t_curr.item() * (N - 1) / T)
+                sigma = discrete_sigmas[idx]
+                adjacent_sigma = (discrete_sigmas[idx - 1]
+                                  if idx > 0
+                                  else torch.zeros_like(sigma))
+                # G = sqrt(σ²_i - σ²_{i-1})
+                G_sq = sigma ** 2 - adjacent_sigma ** 2
+                G = torch.sqrt(G_sq)
+
+                # Reverse step: x_mean = x + G² · score
+                z = torch.randn_like(x)
+                x_mean = x + _expand(G_sq, x) * score
+                x = x_mean + _expand(G, x) * z
+
+            # Noise removal: use denoised x_mean at final step
+            x = x_mean
+
+            all_samples.append(x.cpu().numpy())
+            n_remaining -= B
+
+        samples = np.concatenate(all_samples, axis=0)[:n_samples]
+
+        # Denormalize back to original data scale
+        if self.normalize_mode == "global":
+            samples = samples * self.data_std + self.data_mean
+        elif self.normalize_mode == "per_path" and self.path_means is not None:
+            indices = np.random.randint(0, len(self.path_means),
+                                        size=samples.shape[0])
+            mu = self.path_means[indices]
+            sigma = self.path_stds[indices]
+            samples = samples * sigma[:, None] + mu[:, None]
+            print(f"  Per-path denorm: sampled {samples.shape[0]} "
+                  f"(mu, sigma) pairs")
+
+        print(f"Generated {samples.shape[0]} samples of length "
+              f"{samples.shape[1]}")
+
+        if self.use_ema:
+            self.ema.restore()
+
+        return samples
+
+    @torch.no_grad()
+    def generate_em(self, n_samples=120, seq_len=None, batch_size=None):
+        """Generate via Euler-Maruyama on reverse SDE (legacy sampler).
+
+        Kept for comparison. The PC sampler (generate()) is recommended.
+        """
         if self.use_ema:
             self.ema.apply_shadow()
 
@@ -540,55 +666,36 @@ class GBMFinancialDiffusion:
         batch_size = batch_size or min(n_samples, 32)
         N = self.config["n_reverse_steps"]
         T = self.sde.T
-        eps = 1e-3  # Don't integrate all the way to t=0 for stability
+        eps = 1e-3
 
         all_samples = []
         n_remaining = n_samples
 
-        print(f"\nGenerating {n_samples} samples (N={N} reverse steps)...")
+        print(f"\nGenerating {n_samples} samples (EM, N={N} steps)...")
 
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-
-            # Sample from prior: x_T ~ p_T
             x = self.sde.prior_sampling((B, seq_len)).to(self.device)
-
-            # Time steps: T → eps
             timesteps = torch.linspace(T, eps, N, device=self.device)
 
-            for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False, mininterval=2.0):
+            for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False,
+                          mininterval=2.0):
                 t_curr = timesteps[i]
                 t_next = timesteps[i + 1]
                 dt = t_next - t_curr  # negative
 
-                # Current time as batch
                 t_batch = torch.full((B,), t_curr, device=self.device)
-
-                # Get noise prediction
                 eps_pred = self.model(x, t_batch)
-
-                # Convert to score: s = -ε_θ / σ_t
                 _, std = self.sde.marginal_prob(x, t_batch)
-                if std.dim() == 1:
-                    score = -eps_pred / std.unsqueeze(-1).clamp(min=1e-8)
-                else:
-                    score = -eps_pred / std.clamp(min=1e-8)
+                score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
 
-                # Get SDE coefficients
                 drift, diffusion = self.sde.sde(x, t_batch)
-
-                # Reverse SDE: dX = [f - g² · score] dt + g dW̄
-                if diffusion.dim() == 1:
-                    g_sq = diffusion.pow(2).unsqueeze(-1)
-                    g = diffusion.unsqueeze(-1)
-                else:
-                    g_sq = diffusion.pow(2)
-                    g = diffusion
+                g_sq = _expand(diffusion, x) ** 2
+                g = _expand(diffusion, x)
 
                 rev_drift = drift - g_sq * score
                 x_mean = x + rev_drift * dt
 
-                # Add noise (except at the last step)
                 if i < N - 2:
                     noise = torch.randn_like(x)
                     x = x_mean + g * torch.sqrt(torch.abs(dt)) * noise
@@ -600,20 +707,18 @@ class GBMFinancialDiffusion:
 
         samples = np.concatenate(all_samples, axis=0)[:n_samples]
 
-        # Denormalize back to original data scale
         if self.normalize_mode == "global":
             samples = samples * self.data_std + self.data_mean
         elif self.normalize_mode == "per_path" and self.path_means is not None:
-            # Sample (μ, σ) from empirical distribution of training paths
-            indices = np.random.randint(0, len(self.path_means), size=samples.shape[0])
-            mu = self.path_means[indices]    # (n_samples,)
-            sigma = self.path_stds[indices]  # (n_samples,)
+            indices = np.random.randint(0, len(self.path_means),
+                                        size=samples.shape[0])
+            mu = self.path_means[indices]
+            sigma = self.path_stds[indices]
             samples = samples * sigma[:, None] + mu[:, None]
-            print(f"  Per-path denorm: sampled {samples.shape[0]} (mu, sigma) pairs")
 
-        print(f"Generated {samples.shape[0]} samples of length {samples.shape[1]}")
+        print(f"Generated {samples.shape[0]} samples of length "
+              f"{samples.shape[1]}")
 
-        # Restore training weights after generation
         if self.use_ema:
             self.ema.restore()
 
