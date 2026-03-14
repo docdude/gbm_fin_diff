@@ -106,6 +106,8 @@ def main():
                         help="Langevin corrector SNR (PC sampler only)")
     parser.add_argument("--corrector-steps", type=int, default=1,
                         help="Langevin corrector steps per predictor step (0 = predictor-only)")
+    parser.add_argument("--eps", type=float, default=None,
+                        help="Sampling epsilon (min noise level). PC default=1e-5, EM default=1e-3")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--stride", type=int, default=None,
                         help="Override data stride (default: from checkpoint config)")
@@ -121,6 +123,8 @@ def main():
             suffix = "pc_pred_only"
         elif args.sampler == "pc":
             suffix = f"pc_snr{args.snr}"
+        if args.eps is not None:
+            suffix += f"_eps{args.eps}"
         args.save_dir = os.path.join(ckpt_dir, f"eval_{suffix}")
     os.makedirs(args.save_dir, exist_ok=True)
 
@@ -144,6 +148,8 @@ def main():
     config["n_reverse_steps"] = args.n_reverse
     config["pc_snr"] = args.snr
     config["pc_corrector_steps"] = args.corrector_steps
+    if args.eps is not None:
+        config["sampling_eps"] = args.eps
 
     # Ensure sigma_max is numeric
     if config.get("sigma_max") == "auto" or not isinstance(config.get("sigma_max"), (int, float)):
@@ -227,6 +233,7 @@ def main():
         "n_reverse": args.n_reverse,
         "snr": args.snr,
         "corrector_steps": args.corrector_steps,
+        "eps": args.eps,
         "n_generate": args.n_generate,
         "sigma_max": sigma_max,
         "n_real": real_data.shape[0],
