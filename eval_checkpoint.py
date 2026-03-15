@@ -27,6 +27,7 @@ import os
 import json
 import numpy as np
 import torch
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -215,7 +216,7 @@ def main():
     print_pathwise_summary(gen_pw, real_pw)
 
     # Stylized facts + plots
-    model.evaluate(generated, real_data, save_dir=args.save_dir)
+    gen_results, real_results = model.evaluate(generated, real_data, save_dir=args.save_dir)
 
     if not args.no_plots:
         mode = "log_price" if config.get("sde_type") == "gbm" else "log_return"
@@ -240,6 +241,57 @@ def main():
     }
     with open(os.path.join(args.save_dir, "eval_meta.json"), "w") as f:
         json.dump(eval_meta, f, indent=2)
+
+    # ── Persistent eval log (append one record per run) ──
+    log_record = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "checkpoint": args.checkpoint,
+        "sampler": sampler_label,
+        "eps": args.eps,
+        "snr": args.snr,
+        "corrector_steps": args.corrector_steps,
+        "n_reverse": args.n_reverse,
+        "n_generate": args.n_generate,
+        "sigma_max": sigma_max,
+        "save_dir": args.save_dir,
+    }
+    # Scalar metrics (real, gen, ratio)
+    for name, (r, g) in scalar_metrics.items():
+        key = name.lower().replace(" ", "_").replace("(", "").replace(")", "")
+        ratio = g / r if abs(r) > 1e-12 else float('nan')
+        log_record[f"{key}_real"] = float(r)
+        log_record[f"{key}_gen"] = float(g)
+        log_record[f"{key}_ratio"] = float(ratio)
+    # Pathwise diagnostics (ratios)
+    pw_pairs = [
+        ("rolling_vol_mean", "rolling_vol", "mean_vol"),
+        ("vol_of_vol", "rolling_vol", "vol_of_vol"),
+        ("burst_dur_mean", "burst_duration", "mean"),
+        ("max_dd_mean", "drawdown", "mean_depth"),
+        ("dd_dur_mean", "drawdown", "mean_duration"),
+        ("turning_pt_density", "turning_points", "mean_density"),
+        ("qv_pw_mean", "roughness", "mean_qv"),
+        ("tv_returns_mean", "roughness", "mean_tv_returns"),
+    ]
+    for log_key, pw_group, pw_field in pw_pairs:
+        rv = real_pw[pw_group][pw_field]
+        gv = gen_pw[pw_group][pw_field]
+        log_record[f"{log_key}_real"] = float(rv)
+        log_record[f"{log_key}_gen"] = float(gv)
+        log_record[f"{log_key}_ratio"] = float(gv / rv) if abs(rv) > 1e-12 else float('nan')
+    # Stylized facts
+    log_record["alpha_gen"] = float(gen_results["heavy_tail"]["alpha"])
+    log_record["alpha_real"] = float(real_results["heavy_tail"]["alpha"]) if real_results else None
+    log_record["beta_gen"] = float(gen_results["volatility_clustering"]["beta"])
+    log_record["beta_real"] = float(real_results["volatility_clustering"]["beta"]) if real_results else None
+    lev = gen_results["leverage_effect"]["leverage_correlation"]
+    log_record["leverage_L1_gen"] = float(lev[1]) if len(lev) > 1 else None
+
+    # Append to project-root log file
+    log_path = os.path.join(os.path.dirname(__file__), "eval_log.jsonl")
+    with open(log_path, "a") as f:
+        f.write(json.dumps(log_record) + "\n")
+    print(f"  → Appended to {log_path}")
 
     print(f"\nResults saved to {args.save_dir}/")
 
