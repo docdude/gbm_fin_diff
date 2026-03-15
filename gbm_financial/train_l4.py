@@ -263,7 +263,7 @@ def run_experiment(config, save_dir, resume_path=None):
             "data_mean": model.data_mean,
             "data_std": model.data_std,
             "use_ema": model.use_ema,
-            "likelihood_weighting": model.use_likelihood_weighting,
+            "loss_weighting": model.loss_weighting,
             "n_model_params": sum(p.numel() for p in model.model.parameters()),
             "total_gradient_steps": config["epochs"] * n_batches,
             "n_batches_per_epoch": n_batches,

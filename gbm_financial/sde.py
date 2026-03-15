@@ -228,17 +228,19 @@ class subVPSDE(SDE):
 
 
 class VESDE(SDE):
-  def __init__(self, sigma_min=0.01, sigma_max=50, N=1000):
+  def __init__(self, sigma_min=0.01, sigma_max=50, N=1000, schedule="exponential"):
     """Construct a Variance Exploding SDE.
 
     Args:
       sigma_min: smallest sigma.
       sigma_max: largest sigma.
       N: number of discretization steps
+      schedule: noise schedule — 'exponential', 'cosine', or 'linear'
     """
     super().__init__(N)
     self.sigma_min = sigma_min
     self.sigma_max = sigma_max
+    self.schedule = schedule
     self.discrete_sigmas = torch.exp(torch.linspace(np.log(self.sigma_min), np.log(self.sigma_max), N))
     self.N = N
 
@@ -246,15 +248,40 @@ class VESDE(SDE):
   def T(self):
     return 1
 
+  def _sigma(self, t):
+    """Compute σ(t) for the configured noise schedule."""
+    if self.schedule == "exponential":
+      return self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+    elif self.schedule == "cosine":
+      return self.sigma_min + (self.sigma_max - self.sigma_min) * (1.0 - torch.cos(math.pi * t)) / 2.0
+    elif self.schedule == "linear":
+      sigma_sq = self.sigma_min ** 2 + t * (self.sigma_max ** 2 - self.sigma_min ** 2)
+      return torch.sqrt(sigma_sq)
+    else:
+      raise ValueError(f"Unknown schedule: {self.schedule}")
+
+  def _dsigma_sq_dt(self, t, sigma):
+    """Compute d[σ²(t)]/dt for the diffusion coefficient g(t) = sqrt(d[σ²]/dt)."""
+    if self.schedule == "exponential":
+      log_ratio = np.log(self.sigma_max / self.sigma_min)
+      return 2.0 * log_ratio * sigma.pow(2)
+    elif self.schedule == "cosine":
+      dsigma_dt = (self.sigma_max - self.sigma_min) * math.pi * torch.sin(math.pi * t) / 2.0
+      return 2.0 * sigma * dsigma_dt
+    elif self.schedule == "linear":
+      return torch.full_like(t, self.sigma_max ** 2 - self.sigma_min ** 2)
+    else:
+      raise ValueError(f"Unknown schedule: {self.schedule}")
+
   def sde(self, x, t):
-    sigma = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+    sigma = self._sigma(t)
     drift = torch.zeros_like(x)
-    diffusion = sigma * torch.sqrt(torch.tensor(2 * (np.log(self.sigma_max) - np.log(self.sigma_min)),
-                                                device=t.device))
+    dsig2 = self._dsigma_sq_dt(t, sigma)
+    diffusion = torch.sqrt(dsig2.clamp(min=1e-12))
     return drift, diffusion
 
   def marginal_prob(self, x, t):
-    std = self.sigma_min * (self.sigma_max / self.sigma_min) ** t
+    std = self._sigma(t)
     mean = x
     return mean, std
 
@@ -301,8 +328,8 @@ class GBMSDE(VESDE):
   See train_l4.py's auto-compute logic.
   """
 
-  def __init__(self, sigma_min=0.01, sigma_max=5.0, N=2000):
-    super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, N=N)
+  def __init__(self, sigma_min=0.01, sigma_max=5.0, N=2000, schedule="exponential"):
+    super().__init__(sigma_min=sigma_min, sigma_max=sigma_max, N=N, schedule=schedule)
 
 
 # ==========================================================================
@@ -342,19 +369,18 @@ def get_sde(sde_type: str, schedule: str = "exponential",
 
   Args:
       sde_type: 've', 'vp', 'subvp', or 'gbm'
-      schedule: 'linear', 'exponential', or 'cosine' (only used for display;
-                all VE/GBM SDEs use the geometric schedule σ_min·(σ_max/σ_min)^t)
+      schedule: 'linear', 'exponential', or 'cosine' (VE/GBM noise schedule)
       sigma_min, sigma_max: noise bounds
       N: number of discretization steps
   """
   sde_type = sde_type.lower()
   if sde_type == "ve":
-    return VESDE(sigma_min, sigma_max, N)
+    return VESDE(sigma_min, sigma_max, N, schedule=schedule)
   elif sde_type == "vp":
     return VPSDE(beta_min=0.1, beta_max=20, N=N)
   elif sde_type == "subvp":
     return subVPSDE(beta_min=0.1, beta_max=20, N=N)
   elif sde_type == "gbm":
-    return GBMSDE(sigma_min, sigma_max, N)
+    return GBMSDE(sigma_min, sigma_max, N, schedule=schedule)
   else:
     raise ValueError(f"Unknown SDE type: {sde_type}. Choose from: ve, vp, subvp, gbm")

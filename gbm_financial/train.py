@@ -158,9 +158,19 @@ class GBMFinancialDiffusion:
         else:
             self.ema = None
 
-        # Likelihood weighting for VE/GBM SDEs
-        # score_sde uses λ(t) = σ_t² to ensure equal contribution across noise scales
-        self.use_likelihood_weighting = config.get("likelihood_weighting", False)
+        # Loss weighting strategy:
+        #   "uniform"    — standard unweighted ε-prediction loss (default)
+        #   "min_snr_5"  — min(SNR, γ=5) weighting: upweights low-noise timesteps
+        #                  where fine-grained structure (QV) is determined
+        #   "min_snr_1"  — more aggressive variant with γ=1
+        #   "likelihood" — g²/σ² weighting (constant for VE+exponential)
+        # Backward compat: likelihood_weighting: true → "likelihood"
+        if config.get("likelihood_weighting", False):
+            self.loss_weighting = "likelihood"
+        else:
+            self.loss_weighting = config.get("loss_weighting", "uniform")
+        if self.loss_weighting != "uniform":
+            print(f"  Loss weighting: {self.loss_weighting}")
 
         # Optimizer
         self.optimizer = Adam(
@@ -285,14 +295,20 @@ class GBMFinancialDiffusion:
             losses = losses.clone()
             losses[:, 0] = 0.0
 
-        # Optional likelihood weighting: λ(t) = g(t)²/σ_t²
-        # From score_sde: loss = g² * ||score + z/σ||² = (g²/σ²) * ||z - ε_θ||²
-        # For VE+exponential: g²/σ² = 2·ln(σ_max/σ_min) (constant — no effect)
-        # For other schedules: reweights to emphasize low-noise regime
-        if self.use_likelihood_weighting:
+        # Apply loss weighting
+        if self.loss_weighting == "likelihood":
             _, diffusion = self.sde.sde(x_0, t)  # g(t)
-            g2 = diffusion.pow(2)  # g(t)²
+            g2 = diffusion.pow(2)
             weights = g2 / std.pow(2).clamp(min=1e-12)  # g²/σ²
+            if weights.dim() == 1:
+                weights = weights.unsqueeze(-1)
+            losses = losses * weights
+        elif self.loss_weighting.startswith("min_snr"):
+            # min-SNR-γ: weight = min(γ, 1/σ²) — upweights low-noise regime
+            # For VE: SNR ∝ 1/σ², so this caps the max weight at γ
+            gamma = float(self.loss_weighting.split("_")[-1])
+            snr = 1.0 / std.pow(2).clamp(min=1e-12)
+            weights = torch.clamp(snr, max=gamma)
             if weights.dim() == 1:
                 weights = weights.unsqueeze(-1)
             losses = losses * weights
@@ -477,9 +493,25 @@ class GBMFinancialDiffusion:
                 val_loss = self._validate(val_loader)
                 val_loss_str = f", val_loss={val_loss:.4e}"
                 writer.add_scalar("loss/val", val_loss, epoch + 1)
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    self.save(os.path.join(save_dir, "best_model.pth"))
+
+                # EMA validation — use this for best_model selection since
+                # generate() uses EMA weights via ema.apply_shadow()
+                if self.use_ema:
+                    self.ema.apply_shadow()
+                    ema_val = self._validate(val_loader)
+                    self.ema.restore()
+                    writer.add_scalar("loss/val_ema", ema_val, epoch + 1)
+                    writer.add_scalar("ema/gap", val_loss - ema_val, epoch + 1)
+                    val_loss_str += f", ema_val={ema_val:.4e}"
+                    # Select best model by EMA val_loss (matches generation weights)
+                    if ema_val < best_val_loss:
+                        best_val_loss = ema_val
+                        self.save(os.path.join(save_dir, "best_model.pth"))
+                        print(f"    ★ New best EMA val_loss: {ema_val:.4e}")
+                else:
+                    if val_loss < best_val_loss:
+                        best_val_loss = val_loss
+                        self.save(os.path.join(save_dir, "best_model.pth"))
 
             # Detailed diagnostics (loss by t, by position, score stats)
             if (epoch + 1) % diag_every == 0 or epoch == 0:
@@ -502,13 +534,7 @@ class GBMFinancialDiffusion:
                 for stat, val in diag["score_stats"].items():
                     writer.add_scalar(f"score/{stat}", val, epoch + 1)
 
-                # EMA val loss (compare with non-EMA)
-                if self.use_ema and val_loader is not None and (epoch + 1) % 20 == 0:
-                    self.ema.apply_shadow()
-                    ema_val = self._validate(val_loader)
-                    self.ema.restore()
-                    writer.add_scalar("loss/val_ema", ema_val, epoch + 1)
-                    writer.add_scalar("ema/gap", val_loss - ema_val, epoch + 1)
+                # EMA val loss logged above in validation block
 
             # Log every 10 epochs
             if (epoch + 1) % 10 == 0 or epoch == 0:

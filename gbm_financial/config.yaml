@@ -41,7 +41,7 @@ batch_size: 64
 lr: 1.0e-3
 weight_decay: 1.0e-6
 ema_decay: 0.999             # EMA of model weights (score_sde default; paper omits this)
-likelihood_weighting: false  # λ(t) = σ_t² weighting (score_sde default for VE)
+loss_weighting: "uniform"    # "uniform", "min_snr_5", "min_snr_1", "likelihood"
 
 # ========================
 # Data (Section 3.1.2)
