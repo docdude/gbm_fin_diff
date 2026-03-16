@@ -63,7 +63,7 @@ PAPER_CONFIG = {
     "lr": 1e-3,
     "weight_decay": 1e-6,
     "ema_decay": 0.999,
-    "likelihood_weighting": False,
+    "loss_weighting": "uniform",
 
     # Data (Section 3.1.2)
     "window_len": 2048,
@@ -359,6 +359,9 @@ def main():
                         help="Disable anchor masking (include pos 0 in loss)")
     parser.add_argument("--n-reverse", type=int, default=None,
                         help="Override number of reverse SDE steps for generation")
+    parser.add_argument("--loss-weighting", type=str, default=None,
+                        choices=["uniform", "min_snr_5", "min_snr_1", "likelihood"],
+                        help="Loss weighting strategy (default: uniform)")
     args = parser.parse_args()
 
     if args.minimal:
@@ -386,6 +389,8 @@ def main():
         config["mask_anchor"] = False
     if args.n_reverse:
         config["n_reverse_steps"] = args.n_reverse
+    if args.loss_weighting:
+        config["loss_weighting"] = args.loss_weighting
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)
