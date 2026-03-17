@@ -181,11 +181,19 @@ class GBMFinancialDiffusion:
 
         # LR scheduler
         epochs = config["epochs"]
-        p1 = int(0.75 * epochs)
-        p2 = int(0.9 * epochs)
-        self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
-            self.optimizer, milestones=[p1, p2], gamma=0.1
-        )
+        lr_schedule = config.get("lr_schedule", "multistep")
+        if lr_schedule == "cosine":
+            lr_min = config.get("lr_min", 0.0)
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=epochs, eta_min=lr_min
+            )
+            print(f"  LR schedule: cosine (lr_min={lr_min})")
+        else:
+            p1 = int(0.75 * epochs)
+            p2 = int(0.9 * epochs)
+            self.scheduler = torch.optim.lr_scheduler.MultiStepLR(
+                self.optimizer, milestones=[p1, p2], gamma=0.1
+            )
 
         # Data mode — with validation
         self.data_mode = "log_price" if config["sde_type"] == "gbm" else "log_return"
@@ -558,7 +566,8 @@ class GBMFinancialDiffusion:
                 print(f"  Epoch {epoch + 1:4d}/{epochs}: loss={avg_loss:.4e}, lr={lr:.2e}{val_loss_str}")
 
             # Save checkpoint periodically
-            if (epoch + 1) % 100 == 0:
+            ckpt_every = config.get("checkpoint_every", 100)
+            if (epoch + 1) % ckpt_every == 0:
                 self.save(os.path.join(save_dir, f"checkpoint_epoch{epoch + 1}.pth"),
                           epoch=epoch + 1, best_val_loss=best_val_loss)
 

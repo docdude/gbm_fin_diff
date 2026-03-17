@@ -41,7 +41,10 @@ batch_size: 64
 lr: 1.0e-3
 weight_decay: 1.0e-6
 ema_decay: 0.999             # EMA of model weights (score_sde default; paper omits this)
-loss_weighting: "uniform"    # "uniform", "min_snr_5", "min_snr_1", "likelihood"
+loss_weighting: "uniform"    # "uniform", "min_snr_5", "min_snr_3", "min_snr_1", "likelihood"
+lr_schedule: "multistep"     # "multistep" or "cosine"
+lr_min: 0.0                  # minimum LR for cosine schedule
+checkpoint_every: 100        # save checkpoint every N epochs
 
 # ========================
 # Data (Section 3.1.2)

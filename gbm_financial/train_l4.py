@@ -360,8 +360,15 @@ def main():
     parser.add_argument("--n-reverse", type=int, default=None,
                         help="Override number of reverse SDE steps for generation")
     parser.add_argument("--loss-weighting", type=str, default=None,
-                        choices=["uniform", "min_snr_5", "min_snr_1", "likelihood"],
+                        choices=["uniform", "min_snr_5", "min_snr_3", "min_snr_1", "likelihood"],
                         help="Loss weighting strategy (default: uniform)")
+    parser.add_argument("--lr-schedule", type=str, default=None,
+                        choices=["multistep", "cosine"],
+                        help="LR schedule: multistep (default) or cosine annealing")
+    parser.add_argument("--lr-min", type=float, default=None,
+                        help="Minimum LR for cosine schedule (default: 0)")
+    parser.add_argument("--checkpoint-every", type=int, default=None,
+                        help="Save checkpoint every N epochs (default: 100)")
     args = parser.parse_args()
 
     if args.minimal:
@@ -391,6 +398,12 @@ def main():
         config["n_reverse_steps"] = args.n_reverse
     if args.loss_weighting:
         config["loss_weighting"] = args.loss_weighting
+    if args.lr_schedule:
+        config["lr_schedule"] = args.lr_schedule
+    if args.lr_min is not None:
+        config["lr_min"] = args.lr_min
+    if args.checkpoint_every:
+        config["checkpoint_every"] = args.checkpoint_every
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)
