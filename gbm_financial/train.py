@@ -397,7 +397,10 @@ class GBMFinancialDiffusion:
         os.makedirs(save_dir, exist_ok=True)
         config = self.config
         epochs = config["epochs"]
-        best_val_loss = float("inf")
+        start_epoch = getattr(self, '_resume_epoch', None) or 0
+        best_val_loss = getattr(self, '_resume_best_val_loss', None) or float("inf")
+        if start_epoch > 0:
+            print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss}")
 
         # TensorBoard
         tb_dir = os.path.join(save_dir, "tb")
@@ -438,7 +441,7 @@ class GBMFinancialDiffusion:
         print(f"  data mode={self.data_mode}")
         print(f"  normalization: {self.normalize_mode}")
 
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             self.model.train()
             epoch_loss = 0
             n_batches = 0
@@ -506,12 +509,14 @@ class GBMFinancialDiffusion:
                     # Select best model by EMA val_loss (matches generation weights)
                     if ema_val < best_val_loss:
                         best_val_loss = ema_val
-                        self.save(os.path.join(save_dir, "best_model.pth"))
+                        self.save(os.path.join(save_dir, "best_model.pth"),
+                                  epoch=epoch + 1, best_val_loss=best_val_loss)
                         print(f"    ★ New best EMA val_loss: {ema_val:.4e}")
                 else:
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
-                        self.save(os.path.join(save_dir, "best_model.pth"))
+                        self.save(os.path.join(save_dir, "best_model.pth"),
+                                  epoch=epoch + 1, best_val_loss=best_val_loss)
 
             # Detailed diagnostics (loss by t, by position, score stats)
             if (epoch + 1) % diag_every == 0 or epoch == 0:
@@ -542,10 +547,12 @@ class GBMFinancialDiffusion:
 
             # Save checkpoint periodically
             if (epoch + 1) % 100 == 0:
-                self.save(os.path.join(save_dir, f"checkpoint_epoch{epoch + 1}.pth"))
+                self.save(os.path.join(save_dir, f"checkpoint_epoch{epoch + 1}.pth"),
+                          epoch=epoch + 1, best_val_loss=best_val_loss)
 
         # Final save
-        self.save(os.path.join(save_dir, "final_model.pth"))
+        self.save(os.path.join(save_dir, "final_model.pth"),
+                  epoch=epochs, best_val_loss=best_val_loss)
         writer.close()
         print(f"\nTraining complete. Models saved to {save_dir}")
         print(f"TensorBoard logs: tensorboard --logdir {tb_dir}")
@@ -880,7 +887,7 @@ class GBMFinancialDiffusion:
 
         return gen_results, real_results
 
-    def save(self, path):
+    def save(self, path, epoch=None, best_val_loss=None):
         """Save model checkpoint (includes EMA state if enabled)."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
         checkpoint = {
@@ -891,6 +898,10 @@ class GBMFinancialDiffusion:
             "data_std": self.data_std,
             "normalize_mode": self.normalize_mode,
         }
+        if epoch is not None:
+            checkpoint["epoch"] = epoch
+        if best_val_loss is not None:
+            checkpoint["best_val_loss"] = best_val_loss
         if self.path_means is not None:
             checkpoint["path_means"] = self.path_means
             checkpoint["path_stds"] = self.path_stds
@@ -910,6 +921,11 @@ class GBMFinancialDiffusion:
         if self.use_ema and "ema_state_dict" in checkpoint:
             self.ema.load_state_dict(checkpoint["ema_state_dict"])
             print(f"  EMA state restored")
+        # Restore epoch tracking
+        self._resume_epoch = checkpoint.get("epoch", None)
+        self._resume_best_val_loss = checkpoint.get("best_val_loss", None)
+        if self._resume_epoch is not None:
+            print(f"  Resume from epoch {self._resume_epoch}")
         # Restore data normalization stats
         if "data_mean" in checkpoint:
             self.data_mean = checkpoint["data_mean"]
