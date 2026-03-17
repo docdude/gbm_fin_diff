@@ -399,6 +399,7 @@ class GBMFinancialDiffusion:
         epochs = config["epochs"]
         start_epoch = getattr(self, '_resume_epoch', None) or 0
         best_val_loss = getattr(self, '_resume_best_val_loss', None) or float("inf")
+        self._best_epoch = start_epoch  # track which epoch produced best_model
         if start_epoch > 0:
             print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss}")
 
@@ -508,14 +509,25 @@ class GBMFinancialDiffusion:
                     val_loss_str += f", ema_val={ema_val:.4e}"
                     # Select best model by EMA val_loss (matches generation weights)
                     if ema_val < best_val_loss:
+                        # Keep history: rename previous best before overwriting
+                        best_path = os.path.join(save_dir, "best_model.pth")
+                        if os.path.exists(best_path):
+                            prev_name = f"best_model_ep{self._best_epoch}_val{best_val_loss:.4f}.pth"
+                            os.rename(best_path, os.path.join(save_dir, prev_name))
                         best_val_loss = ema_val
-                        self.save(os.path.join(save_dir, "best_model.pth"),
+                        self._best_epoch = epoch + 1
+                        self.save(best_path,
                                   epoch=epoch + 1, best_val_loss=best_val_loss)
                         print(f"    ★ New best EMA val_loss: {ema_val:.4e}")
                 else:
                     if val_loss < best_val_loss:
+                        best_path = os.path.join(save_dir, "best_model.pth")
+                        if os.path.exists(best_path):
+                            prev_name = f"best_model_ep{self._best_epoch}_val{best_val_loss:.4f}.pth"
+                            os.rename(best_path, os.path.join(save_dir, prev_name))
                         best_val_loss = val_loss
-                        self.save(os.path.join(save_dir, "best_model.pth"),
+                        self._best_epoch = epoch + 1
+                        self.save(best_path,
                                   epoch=epoch + 1, best_val_loss=best_val_loss)
 
             # Detailed diagnostics (loss by t, by position, score stats)
