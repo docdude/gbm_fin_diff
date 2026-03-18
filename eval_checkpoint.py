@@ -237,7 +237,7 @@ def main():
         "corrector_steps": args.corrector_steps,
         "eps": args.eps,
         "n_generate": args.n_generate,
-        "sigma_max": sigma_max,
+        "sigma_max": config["sigma_max"],
         "n_real": real_data.shape[0],
     }
     with open(os.path.join(args.save_dir, "eval_meta.json"), "w") as f:
@@ -253,7 +253,7 @@ def main():
         "corrector_steps": args.corrector_steps,
         "n_reverse": args.n_reverse,
         "n_generate": args.n_generate,
-        "sigma_max": sigma_max,
+        "sigma_max": config["sigma_max"],
         "save_dir": args.save_dir,
     }
     # Scalar metrics (real, gen, ratio)
