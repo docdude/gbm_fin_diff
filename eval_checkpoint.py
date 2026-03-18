@@ -35,6 +35,8 @@ from gbm_financial.train import GBMFinancialDiffusion
 from gbm_financial.data import get_dataloaders, compute_sigma_max
 from gbm_financial.metrics import (compute_pathwise_diagnostics,
                                    print_pathwise_summary,
+                                   compute_distribution_distances,
+                                   print_distribution_distances,
                                    compute_log_returns,
                                    evaluate_stylized_facts,
                                    plot_stylized_facts,
@@ -216,6 +218,11 @@ def main():
     real_pw = compute_pathwise_diagnostics(real_data, mode="log_price")
     print_pathwise_summary(gen_pw, real_pw)
 
+    # Distribution distances (KS + Wasserstein)
+    dist_distances = compute_distribution_distances(
+        gen_pw, real_pw, gen_data=generated, real_data=real_data)
+    print_distribution_distances(dist_distances)
+
     # Stylized facts + plots
     gen_results, real_results = model.evaluate(generated, real_data, save_dir=args.save_dir)
 
@@ -287,6 +294,11 @@ def main():
     log_record["beta_real"] = float(real_results["volatility_clustering"]["beta"]) if real_results else None
     lev = gen_results["leverage_effect"]["leverage_correlation"]
     log_record["leverage_L1_gen"] = float(lev[1]) if len(lev) > 1 else None
+    # Distribution distances
+    for dist_name, dist_vals in dist_distances.items():
+        log_record[f"ks_{dist_name}"] = dist_vals["ks_stat"]
+        log_record[f"ks_pval_{dist_name}"] = dist_vals["ks_pval"]
+        log_record[f"wass_{dist_name}"] = dist_vals["wasserstein"]
 
     # Append to project-root log file
     log_path = os.path.join(os.path.dirname(__file__), "eval_log.jsonl")

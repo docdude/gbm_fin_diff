@@ -20,7 +20,8 @@ with generative adversarial networks", Physica A, vol. 527.
 """
 
 import numpy as np
-from scipy.stats import linregress
+from scipy.stats import linregress, ks_2samp
+from scipy.stats import wasserstein_distance
 from collections import Counter
 import warnings
 
@@ -653,6 +654,89 @@ def compute_pathwise_diagnostics(data, mode="log_return", vol_window=20):
         "squared_return_acf": compute_squared_return_acf(returns),
         "regime_persistence": compute_regime_persistence(returns, window=vol_window),
     }
+
+
+def compute_distribution_distances(gen_pw, real_pw, gen_data=None, real_data=None):
+    """Compute KS statistic and Wasserstein distance for key pathwise distributions.
+
+    Compares the full per-path distribution shapes (not just means).
+    This catches cases where means match but the histogram shapes differ.
+
+    Args:
+        gen_pw: pathwise diagnostics dict for generated data
+        real_pw: pathwise diagnostics dict for real data
+        gen_data: raw generated log-price paths (N, L) — for terminal values
+        real_data: raw real log-price paths (N, L) — for terminal values
+
+    Returns:
+        dict mapping distribution name → {ks_stat, ks_pval, wasserstein}
+    """
+    comparisons = [
+        ("roughness_tv", real_pw["roughness"]["tv_returns"],
+         gen_pw["roughness"]["tv_returns"]),
+        ("roughness_qv", real_pw["roughness"]["qv"],
+         gen_pw["roughness"]["qv"]),
+        ("drawdown_depth", real_pw["drawdown"]["depths"],
+         gen_pw["drawdown"]["depths"]),
+        ("drawdown_duration", real_pw["drawdown"]["durations"],
+         gen_pw["drawdown"]["durations"]),
+        ("burst_duration", real_pw["burst_duration"]["run_lengths"],
+         gen_pw["burst_duration"]["run_lengths"]),
+        ("turning_pt_density", real_pw["turning_points"]["densities"],
+         gen_pw["turning_points"]["densities"]),
+    ]
+
+    # Add terminal value distribution if raw data provided
+    if gen_data is not None and real_data is not None:
+        comparisons.append(
+            ("terminal_value", real_data[:, -1].tolist(),
+             gen_data[:, -1].tolist()))
+
+    results = {}
+    for name, real_arr, gen_arr in comparisons:
+        real_a = np.asarray(real_arr, dtype=float)
+        gen_a = np.asarray(gen_arr, dtype=float)
+
+        # Need at least 2 samples each
+        if len(real_a) < 2 or len(gen_a) < 2:
+            results[name] = {"ks_stat": np.nan, "ks_pval": np.nan,
+                             "wasserstein": np.nan}
+            continue
+
+        ks_stat, ks_pval = ks_2samp(real_a, gen_a)
+        w_dist = wasserstein_distance(real_a, gen_a)
+
+        results[name] = {
+            "ks_stat": float(ks_stat),
+            "ks_pval": float(ks_pval),
+            "wasserstein": float(w_dist),
+        }
+
+    return results
+
+
+def print_distribution_distances(dist_results):
+    """Print distribution distance summary table."""
+    print("\n" + "=" * 70)
+    print("DISTRIBUTION DISTANCES — Real vs Generated")
+    print("=" * 70)
+    print(f"  {'Distribution':<25s} {'KS stat':>8s} {'KS p-val':>10s} {'Wass. dist':>12s}")
+    print(f"  {'-'*25} {'-'*8} {'-'*10} {'-'*12}")
+    for name, vals in dist_results.items():
+        ks = vals["ks_stat"]
+        pv = vals["ks_pval"]
+        wd = vals["wasserstein"]
+        pv_str = f"{pv:.4f}" if not np.isnan(pv) else "N/A"
+        # Flag: * if KS rejects at 5%, ** at 1%
+        flag = ""
+        if not np.isnan(pv):
+            if pv < 0.01:
+                flag = " **"
+            elif pv < 0.05:
+                flag = " *"
+        print(f"  {name:<25s} {ks:8.4f} {pv_str:>10s} {wd:12.4f}{flag}")
+    print(f"  {'':>25s} {'':>8s} {'* p<.05':>10s} {'** p<.01':>12s}")
+    print("=" * 70)
 
 
 def print_pathwise_summary(gen_pw, real_pw):
