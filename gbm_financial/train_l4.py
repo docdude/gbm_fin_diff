@@ -71,8 +71,10 @@ PAPER_CONFIG = {
     "min_years": 40,
     "use_synthetic": False,
 
-    # Generation
+    # Generation / Sampling
     "n_generate": 120,
+    "sampling_eps": 4e-4,
+    "pc_corrector_steps": 0,
 
     # No z-score normalization for GBM/log-price (paper faithful).
     # Global z-score of cumulative paths induces mean-reversion.

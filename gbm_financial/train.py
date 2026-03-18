@@ -616,11 +616,11 @@ class GBMFinancialDiffusion:
         batch_size = batch_size or min(n_samples, 32)
         N = self.config["n_reverse_steps"]  # = sde.N
         T = self.sde.T
-        eps = self.config.get("sampling_eps", 1e-5)
+        eps = self.config.get("sampling_eps", 4e-4)
 
-        # PC sampler parameters (score_sde VE defaults)
+        # PC sampler parameters
         snr = self.config.get("pc_snr", 0.16)
-        n_corrector_steps = self.config.get("pc_corrector_steps", 1)
+        n_corrector_steps = self.config.get("pc_corrector_steps", 0)
 
         all_samples = []
         n_remaining = n_samples

@@ -56,6 +56,8 @@ min_years: 40          # minimum stock history in years
 use_synthetic: false   # set true to use synthetic GBM data (no download)
 
 # ========================
-# Generation
+# Generation / Sampling
 # ========================
-n_generate: 120        # number of synthetic series to generate per evaluation
+n_generate: 120            # number of synthetic series to generate per evaluation
+sampling_eps: 4.0e-4       # minimum diffusion time for reverse sampling (critical for QV)
+pc_corrector_steps: 0      # 0 = predictor-only (recommended); 1 = add Langevin corrector
