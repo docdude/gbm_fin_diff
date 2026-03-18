@@ -105,7 +105,7 @@ def main():
     parser.add_argument("--n-reverse", type=int, default=2000)
     parser.add_argument("--snr", type=float, default=0.16,
                         help="Langevin corrector SNR (PC sampler only)")
-    parser.add_argument("--corrector-steps", type=int, default=1,
+    parser.add_argument("--corrector-steps", type=int, default=0,
                         help="Langevin corrector steps per predictor step (0 = predictor-only)")
     parser.add_argument("--eps", type=float, default=None,
                         help="Sampling epsilon (min noise level). PC default=1e-5, EM default=1e-3")
@@ -152,10 +152,6 @@ def main():
     if args.eps is not None:
         config["sampling_eps"] = args.eps
 
-    # Ensure sigma_max is numeric
-    if config.get("sigma_max") == "auto" or not isinstance(config.get("sigma_max"), (int, float)):
-        config["sigma_max"] = 10.0  # placeholder, will be overridden below
-
     # Load data
     print("Loading data...")
     stride = args.stride or config.get("stride", 400)
@@ -170,10 +166,15 @@ def main():
         num_workers=2,
     )
 
-    # Auto σ_max from data
-    sigma_max, _ = compute_sigma_max(train_loader)
-    config["sigma_max"] = sigma_max
-    print(f"σ_max (auto) = {sigma_max:.2f}")
+    # σ_max: prefer saved numeric value from checkpoint/config (deterministic).
+    # Only recompute from data if missing or set to "auto".
+    saved_sigma = config.get("sigma_max")
+    if isinstance(saved_sigma, (int, float)) and saved_sigma > 0:
+        print(f"σ_max (from config) = {saved_sigma:.2f}")
+    else:
+        sigma_max, _ = compute_sigma_max(train_loader)
+        config["sigma_max"] = sigma_max
+        print(f"σ_max (auto-computed) = {sigma_max:.2f}")
 
     # Gather real data
     real_data = np.concatenate([b.numpy() for b in train_loader], axis=0)
