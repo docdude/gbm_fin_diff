@@ -122,6 +122,56 @@ class PositionalEncoding(nn.Module):
         return x + self.pe[: x.size(0)].unsqueeze(1)
 
 
+class WaveNetTemporalBlock(nn.Module):
+    """Dilated causal convolution stack with gated activations (WaveNet-style).
+
+    Processes temporal sequences through exponentially dilated causal Conv1d
+    layers with tanh * sigmoid gating — identical to the gating in CSDI's
+    ResidualBlock but operating locally instead of globally.
+
+    Architecture mirrors the WaveNet GAN generator from notebooks 07/12:
+      - Dilated causal Conv1d (kernel=3, dilation=2^i)
+      - Gated activation: tanh(conv_filter) * sigmoid(conv_gate)
+      - Per-layer 1×1 skip projection, summed across layers
+      - Per-layer 1×1 residual projection for cascading
+
+    For seq_len=2048 with dilation_rates=(1,2,4,8,16,32,64,128,256):
+      receptive field = sum(d)*(k-1)+1 = 511*2+1 = 1023 timesteps
+    """
+
+    def __init__(self, channels, dilation_rates=(1, 2, 4, 8, 16, 32, 64, 128, 256),
+                 kernel_size=3):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.layers = nn.ModuleList()
+        for d in dilation_rates:
+            self.layers.append(nn.ModuleDict({
+                'conv_filter': nn.Conv1d(channels, channels, kernel_size,
+                                         padding=0, dilation=d),
+                'conv_gate':   nn.Conv1d(channels, channels, kernel_size,
+                                         padding=0, dilation=d),
+                'res_conv':    nn.Conv1d(channels, channels, 1),
+                'skip_conv':   nn.Conv1d(channels, channels, 1),
+            }))
+        # Initialize skip/res projections near zero for safe warmup
+        for layer in self.layers:
+            nn.init.zeros_(layer['skip_conv'].weight)
+            nn.init.zeros_(layer['skip_conv'].bias)
+
+    def forward(self, x):
+        """x: (B, C, L) → (B, C, L).  Causal: output[t] depends only on input[≤t]."""
+        skip_sum = torch.zeros_like(x)
+        for layer in self.layers:
+            # Causal padding: pad left only
+            pad = (self.kernel_size - 1) * layer['conv_filter'].dilation[0]
+            x_pad = F.pad(x, (pad, 0))
+            h = torch.tanh(layer['conv_filter'](x_pad)) * \
+                torch.sigmoid(layer['conv_gate'](x_pad))
+            skip_sum = skip_sum + layer['skip_conv'](h)
+            x = x + layer['res_conv'](h)
+        return skip_sum
+
+
 class ResidualBlockWithPosEnc(ResidualBlock):
     """CSDI ResidualBlock with positional encoding added before Transformer.
 
@@ -134,11 +184,19 @@ class ResidualBlockWithPosEnc(ResidualBlock):
         Standard Transformer uses 4*d_model. With K=1 (univariate), the
         time_layer Transformer is the ONLY attention pathway (feature_layer
         is no-op), so adequate FFN capacity is critical.
+
+    Optional WaveNet branch (wavenet_branch=True):
+      Adds a parallel dilated causal convolution stack that processes the
+      temporal signal alongside the Transformer. The two outputs are merged
+      via a learnable gate (initialized to 0 so the model starts identical
+      to the original Transformer-only architecture).
     """
 
-    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads, is_linear=False):
+    def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads,
+                 is_linear=False, wavenet_branch=False, wavenet_dilation_rates=None):
         super().__init__(side_dim, channels, diffusion_embedding_dim, nheads, is_linear)
         self.pos_encoding = PositionalEncoding(channels)
+        self.use_wavenet = wavenet_branch
 
         # Fix: replace the time_layer Transformer with proper dim_feedforward.
         # CSDI's get_torch_trans() hardcodes dim_feedforward=64, which creates
@@ -155,6 +213,17 @@ class ResidualBlockWithPosEnc(ResidualBlock):
             )
             self.time_layer = nn.TransformerEncoder(encoder_layer, num_layers=1)
 
+        # Optional: parallel WaveNet dilated causal conv branch
+        if self.use_wavenet:
+            if wavenet_dilation_rates is None:
+                wavenet_dilation_rates = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+            self.wavenet_block = WaveNetTemporalBlock(
+                channels, dilation_rates=wavenet_dilation_rates)
+            # Learnable mix gate — initialized to 0 so training starts
+            # identical to the original Transformer-only architecture.
+            # The model gradually learns how much local signal to inject.
+            self.wavenet_gate = nn.Parameter(torch.zeros(1))
+
     def forward_time(self, y, base_shape):
         B, channel, K, L = base_shape
         if L == 1:
@@ -164,10 +233,18 @@ class ResidualBlockWithPosEnc(ResidualBlock):
         if self.is_linear:
             y = self.time_layer(y.permute(0, 2, 1)).permute(0, 2, 1)
         else:
-            y = y.permute(2, 0, 1)       # (L, B*K, C)
-            y = self.pos_encoding(y)      # ← Paper modification #1
-            y = self.time_layer(y)        # TransformerEncoder (inherited from diff_models.py)
-            y = y.permute(1, 2, 0)        # (B*K, C, L)
+            # Transformer branch (global attention)
+            y_t = y.permute(2, 0, 1)       # (L, B*K, C)
+            y_t = self.pos_encoding(y_t)    # ← Paper modification #1
+            y_t = self.time_layer(y_t)      # TransformerEncoder
+            y_t = y_t.permute(1, 2, 0)      # (B*K, C, L)
+
+            if self.use_wavenet:
+                # WaveNet branch (local dilated causal convolutions)
+                y_w = self.wavenet_block(y)   # (B*K, C, L)
+                y = y_t + torch.sigmoid(self.wavenet_gate) * y_w
+            else:
+                y = y_t
 
         y = y.reshape(B, K, channel, L).permute(0, 2, 1, 3).reshape(B, channel, K * L)
         return y
@@ -247,6 +324,16 @@ class FinancialScoreNetwork(CSDI_base):
         # --- Paper modification #2: positional encoding in residual blocks ---
         # Replace diff_CSDI's ResidualBlock instances with ResidualBlockWithPosEnc
         # (subclass that adds pos encoding before Transformer, inherits everything else)
+        #
+        # Optional WaveNet branch: when config["wavenet_branch"]=True, each
+        # residual block gets a parallel dilated causal conv stack. Defaults
+        # to False for backward compatibility with existing checkpoints.
+        use_wavenet = config.get("wavenet_branch", False)
+        wavenet_dilations = config.get("wavenet_dilation_rates", None)
+        if use_wavenet:
+            dil_str = wavenet_dilations or (1,2,4,8,16,32,64,128,256)
+            print(f"  WaveNet branch enabled: dilations={list(dil_str)}")
+
         cfg = csdi_config["diffusion"]
         self.diffmodel.residual_layers = nn.ModuleList([
             ResidualBlockWithPosEnc(
@@ -255,6 +342,8 @@ class FinancialScoreNetwork(CSDI_base):
                 diffusion_embedding_dim=cfg["diffusion_embedding_dim"],
                 nheads=cfg["nheads"],
                 is_linear=cfg["is_linear"],
+                wavenet_branch=use_wavenet,
+                wavenet_dilation_rates=wavenet_dilations,
             )
             for _ in range(cfg["layers"])
         ])

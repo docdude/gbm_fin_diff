@@ -931,9 +931,21 @@ class GBMFinancialDiffusion:
         torch.save(checkpoint, path)
 
     def load(self, path):
-        """Load model checkpoint (restores EMA state if present)."""
+        """Load model checkpoint (restores EMA state if present).
+
+        Handles architecture mismatches gracefully (e.g. loading a
+        Transformer-only checkpoint into a model with wavenet_branch=True).
+        Missing WaveNet keys are left at their zero-initialized defaults
+        so training can warm-start from pretrained Transformer weights.
+        """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        result = self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if result.missing_keys:
+            print(f"  Warm-start: {len(result.missing_keys)} new keys "
+                  f"(kept at init): {result.missing_keys[:5]}{'...' if len(result.missing_keys) > 5 else ''}")
+        if result.unexpected_keys:
+            print(f"  Ignored {len(result.unexpected_keys)} extra keys from checkpoint "
+                  f"(architecture mismatch): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
         if "optimizer_state_dict" in checkpoint:
             try:
                 self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])

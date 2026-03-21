@@ -33,6 +33,12 @@ time_emb_dim: 128          # temporal position embedding dim (same as CSDI)
 n_layers: 4                # residual blocks (same as CSDI)
 n_heads: 8                 # attention heads (same as CSDI)
 
+# WaveNet temporal branch (parallel dilated causal convolutions in each residual block)
+# When false: original Transformer-only architecture (all existing checkpoints)
+# When true:  adds local WaveNet conv stack alongside Transformer attention
+wavenet_branch: false
+# wavenet_dilation_rates: [1, 2, 4, 8, 16, 32, 64, 128, 256]  # default if omitted
+
 # ========================
 # Training (Section 4)
 # ========================

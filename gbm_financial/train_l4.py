@@ -56,6 +56,9 @@ PAPER_CONFIG = {
     "n_layers": 4,
     "n_heads": 8,
 
+    # WaveNet temporal branch (off by default — original Transformer-only)
+    "wavenet_branch": False,
+
     # Training (Section 4)
     "seq_len": 2048,
     "epochs": 1000,
