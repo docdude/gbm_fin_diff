@@ -135,8 +135,13 @@ class WaveNetTemporalBlock(nn.Module):
       - Per-layer 1×1 skip projection, summed across layers
       - Per-layer 1×1 residual projection for cascading
 
+    Uses SYMMETRIC (bidirectional) padding, not causal. The score model
+    sees the entire noisy sequence — unlike an autoregressive generator,
+    each position needs context from BOTH past and future to predict noise.
+
     For seq_len=2048 with dilation_rates=(1,2,4,8,16,32,64,128,256):
       receptive field = sum(d)*(k-1)+1 = 511*2+1 = 1023 timesteps
+      (511 in each direction with symmetric padding)
     """
 
     def __init__(self, channels, dilation_rates=(1, 2, 4, 8, 16, 32, 64, 128, 256),
@@ -159,12 +164,17 @@ class WaveNetTemporalBlock(nn.Module):
             nn.init.zeros_(layer['skip_conv'].bias)
 
     def forward(self, x):
-        """x: (B, C, L) → (B, C, L).  Causal: output[t] depends only on input[≤t]."""
+        """x: (B, C, L) → (B, C, L).  Bidirectional: each position sees both past and future."""
         skip_sum = torch.zeros_like(x)
         for layer in self.layers:
-            # Causal padding: pad left only
-            pad = (self.kernel_size - 1) * layer['conv_filter'].dilation[0]
-            x_pad = F.pad(x, (pad, 0))
+            # Symmetric (non-causal) padding: score model is bidirectional
+            # Unlike autoregressive WaveNet GAN, the score network sees the
+            # entire noisy sequence — every position needs context from BOTH
+            # directions to estimate noise accurately.
+            total_pad = (self.kernel_size - 1) * layer['conv_filter'].dilation[0]
+            pad_left = total_pad // 2
+            pad_right = total_pad - pad_left
+            x_pad = F.pad(x, (pad_left, pad_right))
             h = torch.tanh(layer['conv_filter'](x_pad)) * \
                 torch.sigmoid(layer['conv_gate'](x_pad))
             skip_sum = skip_sum + layer['skip_conv'](h)
