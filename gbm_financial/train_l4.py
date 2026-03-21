@@ -374,6 +374,8 @@ def main():
                         help="Minimum LR for cosine schedule (default: 0)")
     parser.add_argument("--checkpoint-every", type=int, default=None,
                         help="Save checkpoint every N epochs (default: 100)")
+    parser.add_argument("--wavenet-branch", action="store_true",
+                        help="Enable parallel WaveNet dilated conv branch in residual blocks")
     args = parser.parse_args()
 
     if args.minimal:
@@ -409,6 +411,8 @@ def main():
         config["lr_min"] = args.lr_min
     if args.checkpoint_every:
         config["checkpoint_every"] = args.checkpoint_every
+    if args.wavenet_branch:
+        config["wavenet_branch"] = True
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)
