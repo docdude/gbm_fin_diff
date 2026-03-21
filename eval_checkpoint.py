@@ -147,6 +147,14 @@ def main():
         print("ERROR: No config found in results.json or checkpoint")
         sys.exit(1)
 
+    # Merge architecture keys from checkpoint config that may be missing
+    # from results.json (e.g. wavenet_branch added after results.json was written)
+    ckpt_config = ckpt.get("config", {})
+    for key in ("wavenet_branch", "wavenet_dilation_rates"):
+        if key not in config and key in ckpt_config:
+            config[key] = ckpt_config[key]
+            print(f"  Merged '{key}={ckpt_config[key]}' from checkpoint config")
+
     # Override sampling params
     config["n_reverse_steps"] = args.n_reverse
     config["pc_snr"] = args.snr
