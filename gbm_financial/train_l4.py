@@ -150,7 +150,7 @@ def ensure_data(config, csv_path="data/sp500.csv"):
             sys.exit(1)
 
 
-def run_experiment(config, save_dir, resume_path=None):
+def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
     """Run a single experiment with the given config."""
     sde_type = config["sde_type"]
     schedule = config["schedule"]
@@ -202,6 +202,10 @@ def run_experiment(config, save_dir, resume_path=None):
     if resume_path:
         model.load(resume_path)
         print(f"Resumed from {resume_path}")
+
+    if warmstart_path:
+        model.load_weights_only(warmstart_path)
+        print(f"Warm-started model weights from {warmstart_path}")
 
     # Train
     start = time.time()
@@ -376,6 +380,9 @@ def main():
                         help="Save checkpoint every N epochs (default: 100)")
     parser.add_argument("--wavenet-branch", action="store_true",
                         help="Enable parallel WaveNet dilated conv branch in residual blocks")
+    parser.add_argument("--warmstart", type=str, default=None,
+                        help="Load model weights only (no optimizer/epoch/scheduler). "
+                             "Use for warm-starting a new architecture from pretrained weights.")
     args = parser.parse_args()
 
     if args.minimal:
@@ -436,7 +443,8 @@ def main():
     if args.grid:
         run_grid(config, args.save_dir)
     else:
-        run_experiment(config, args.save_dir, resume_path=args.resume)
+        run_experiment(config, args.save_dir, resume_path=args.resume,
+                       warmstart_path=args.warmstart)
 
 
 if __name__ == "__main__":

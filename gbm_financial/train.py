@@ -970,3 +970,31 @@ class GBMFinancialDiffusion:
             self.normalize_mode = checkpoint.get("normalize_mode", "per_path")
             print(f"  Per-path stats restored: {len(self.path_means)} windows")
         print(f"Loaded checkpoint from {path}")
+
+    def load_weights_only(self, path):
+        """Load model weights only — no optimizer, epoch, or scheduler state.
+
+        Use for warm-starting a new architecture variant (e.g. adding WaveNet
+        branch to a pretrained Transformer). Optimizer and LR schedule start
+        fresh, epoch counter starts from 0.
+        """
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        result = self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        if result.missing_keys:
+            print(f"  Warm-start: {len(result.missing_keys)} new keys "
+                  f"(kept at init): {result.missing_keys[:5]}{'...' if len(result.missing_keys) > 5 else ''}")
+        if result.unexpected_keys:
+            print(f"  Ignored {len(result.unexpected_keys)} extra keys "
+                  f"(old architecture): {result.unexpected_keys[:5]}{'...' if len(result.unexpected_keys) > 5 else ''}")
+        # Restore data normalization stats (needed for correct data scaling)
+        if "data_mean" in checkpoint:
+            self.data_mean = checkpoint["data_mean"]
+            self.data_std = checkpoint["data_std"]
+            print(f"  Data norm: mean={self.data_mean:.4f}, std={self.data_std:.4f}")
+        if "path_means" in checkpoint:
+            self.path_means = checkpoint["path_means"]
+            self.path_stds = checkpoint["path_stds"]
+            self.normalize_mode = checkpoint.get("normalize_mode", "per_path")
+            print(f"  Per-path stats restored: {len(self.path_means)} windows")
+        # Do NOT restore optimizer, epoch, EMA, scheduler, or best_val_loss
+        print(f"Loaded weights only from {path} (fresh optimizer/schedule)")
