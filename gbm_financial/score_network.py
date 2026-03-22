@@ -158,10 +158,9 @@ class WaveNetTemporalBlock(nn.Module):
                 'res_conv':    nn.Conv1d(channels, channels, 1),
                 'skip_conv':   nn.Conv1d(channels, channels, 1),
             }))
-        # Initialize skip/res projections near zero for safe warmup
-        for layer in self.layers:
-            nn.init.zeros_(layer['skip_conv'].weight)
-            nn.init.zeros_(layer['skip_conv'].bias)
+        # skip_conv uses default Kaiming init (not zero) so that the
+        # WaveNet output is immediately non-trivial and the gate receives
+        # meaningful gradient signal from the start.
 
     def forward(self, x):
         """x: (B, C, L) → (B, C, L).  Bidirectional: each position sees both past and future."""
@@ -229,10 +228,11 @@ class ResidualBlockWithPosEnc(ResidualBlock):
                 wavenet_dilation_rates = (1, 2, 4, 8, 16, 32, 64, 128, 256)
             self.wavenet_block = WaveNetTemporalBlock(
                 channels, dilation_rates=wavenet_dilation_rates)
-            # Learnable mix gate — initialized to 0 so training starts
-            # identical to the original Transformer-only architecture.
-            # The model gradually learns how much local signal to inject.
-            self.wavenet_gate = nn.Parameter(torch.zeros(1))
+            # Learnable mix gate — initialized to -2.2 (sigmoid ≈ 0.1)
+            # so WaveNet starts with small influence, preserving the
+            # pretrained Transformer, while providing enough gradient
+            # signal for the gate to open as WaveNet learns.
+            self.wavenet_gate = nn.Parameter(torch.tensor(-2.2))
 
     def forward_time(self, y, base_shape):
         B, channel, K, L = base_shape
