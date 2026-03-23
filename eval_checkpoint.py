@@ -101,8 +101,10 @@ def main():
     parser.add_argument("--save-dir", type=str, default=None,
                         help="Output directory (default: alongside checkpoint)")
     parser.add_argument("--sampler", type=str, default="pc",
-                        choices=["pc", "em", "ode"],
-                        help="Sampling method: pc (Langevin), em (Euler-Maruyama), ode")
+                        choices=["pc", "em", "ode", "karras"],
+                        help="Sampling method: pc (Langevin), em (Euler-Maruyama), ode, karras (Heun 2nd-order)")
+    parser.add_argument("--karras-rho", type=float, default=None,
+                        help="Karras sigma schedule exponent (default: 7)")
     parser.add_argument("--n-generate", type=int, default=60)
     parser.add_argument("--n-reverse", type=int, default=2000)
     parser.add_argument("--snr", type=float, default=0.16,
@@ -126,6 +128,8 @@ def main():
             suffix = "pc_pred_only"
         elif args.sampler == "pc":
             suffix = f"pc_snr{args.snr}"
+        elif args.sampler == "karras":
+            suffix = f"karras_rho{config.get('karras_rho', 7) if args.karras_rho is None else args.karras_rho}"
         if args.eps is not None:
             suffix += f"_eps{args.eps}"
         args.save_dir = os.path.join(ckpt_dir, f"eval_{suffix}")
@@ -150,7 +154,7 @@ def main():
     # Merge architecture keys from checkpoint config that may be missing
     # from results.json (e.g. wavenet_branch added after results.json was written)
     ckpt_config = ckpt.get("config", {})
-    for key in ("wavenet_branch", "wavenet_dilation_rates"):
+    for key in ("wavenet_branch", "wavenet_dilation_rates", "film_conditioning"):
         if key not in config and key in ckpt_config:
             config[key] = ckpt_config[key]
             print(f"  Merged '{key}={ckpt_config[key]}' from checkpoint config")
@@ -161,6 +165,8 @@ def main():
     config["pc_corrector_steps"] = args.corrector_steps
     if args.eps is not None:
         config["sampling_eps"] = args.eps
+    if args.karras_rho is not None:
+        config["karras_rho"] = args.karras_rho
 
     # Load data
     print("Loading data...")
@@ -215,6 +221,11 @@ def main():
         generated = model.generate_ode(n_samples=args.n_generate,
                                        seq_len=window_len,
                                        batch_size=args.batch_size)
+    elif args.sampler == "karras":
+        sampler_label = f"Karras/Heun (ρ={config.get('karras_rho', 7)})"
+        generated = model.generate_karras(n_samples=args.n_generate,
+                                          seq_len=window_len,
+                                          batch_size=args.batch_size)
 
     np.save(os.path.join(args.save_dir, "generated_data.npy"), generated)
 
