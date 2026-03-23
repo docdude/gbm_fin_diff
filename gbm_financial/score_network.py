@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """Score network for GBM financial diffusion — subclassing the original CSDI.
 
 Paper Section 3.1.1: "We adopt the neural network architecture originally developed
@@ -202,10 +203,12 @@ class ResidualBlockWithPosEnc(ResidualBlock):
     """
 
     def __init__(self, side_dim, channels, diffusion_embedding_dim, nheads,
-                 is_linear=False, wavenet_branch=False, wavenet_dilation_rates=None):
+                 is_linear=False, wavenet_branch=False, wavenet_dilation_rates=None,
+                 film_conditioning=False):
         super().__init__(side_dim, channels, diffusion_embedding_dim, nheads, is_linear)
         self.pos_encoding = PositionalEncoding(channels)
         self.use_wavenet = wavenet_branch
+        self.use_film = film_conditioning
 
         # Fix: replace the time_layer Transformer with proper dim_feedforward.
         # CSDI's get_torch_trans() hardcodes dim_feedforward=64, which creates
@@ -234,6 +237,21 @@ class ResidualBlockWithPosEnc(ResidualBlock):
             # signal for the gate to open as WaveNet learns.
             self.wavenet_gate = nn.Parameter(torch.tensor(-2.2))
 
+        # Optional FiLM conditioning: noise-level-dependent affine modulation
+        # of temporal features. Applies y = y * (1 + γ(t)) + β(t) after
+        # Transformer/WaveNet processing, before mid_projection + gating.
+        # Initialized to neutral (γ=0, β=0) so the model starts identical
+        # to the original architecture.
+        if self.use_film:
+            self.film_mlp = nn.Sequential(
+                nn.Linear(diffusion_embedding_dim, channels * 2),
+                nn.SiLU(),
+                nn.Linear(channels * 2, channels * 2),
+            )
+            # Zero-init last layer → scale=0, shift=0 at start
+            nn.init.zeros_(self.film_mlp[-1].weight)
+            nn.init.zeros_(self.film_mlp[-1].bias)
+
     def forward_time(self, y, base_shape):
         B, channel, K, L = base_shape
         if L == 1:
@@ -258,6 +276,46 @@ class ResidualBlockWithPosEnc(ResidualBlock):
 
         y = y.reshape(B, K, channel, L).permute(0, 2, 1, 3).reshape(B, channel, K * L)
         return y
+
+    def forward(self, x, cond_info, diffusion_emb):
+        """Override parent to insert FiLM modulation after temporal processing.
+
+        When use_film=False, behavior is identical to ResidualBlock.forward().
+        When use_film=True, applies y = y * (1 + γ(t)) + β(t) after
+        forward_time(), modulating temporal features by noise level.
+        """
+        B, channel, K, L = x.shape
+        base_shape = x.shape
+        x = x.reshape(B, channel, K * L)
+
+        diffusion_emb_proj = self.diffusion_projection(diffusion_emb).unsqueeze(-1)
+        y = x + diffusion_emb_proj
+
+        y = self.forward_time(y, base_shape)
+
+        # FiLM: noise-level affine modulation of temporal features
+        if self.use_film:
+            film_params = self.film_mlp(diffusion_emb)          # (B, 2*channel)
+            scale, shift = film_params.chunk(2, dim=1)          # each (B, channel)
+            y = y * (1.0 + scale.unsqueeze(-1)) + shift.unsqueeze(-1)
+
+        y = self.forward_feature(y, base_shape)
+        y = self.mid_projection(y)
+
+        _, cond_dim, _, _ = cond_info.shape
+        cond_info = cond_info.reshape(B, cond_dim, K * L)
+        cond_info = self.cond_projection(cond_info)
+        y = y + cond_info
+
+        gate, filter = torch.chunk(y, 2, dim=1)
+        y = torch.sigmoid(gate) * torch.tanh(filter)
+        y = self.output_projection(y)
+
+        residual, skip = torch.chunk(y, 2, dim=1)
+        x = x.reshape(base_shape)
+        residual = residual.reshape(base_shape)
+        skip = skip.reshape(base_shape)
+        return (x + residual) / math.sqrt(2.0), skip
 
 
 # ---------------------------------------------------------------------------
@@ -340,9 +398,12 @@ class FinancialScoreNetwork(CSDI_base):
         # to False for backward compatibility with existing checkpoints.
         use_wavenet = config.get("wavenet_branch", False)
         wavenet_dilations = config.get("wavenet_dilation_rates", None)
+        use_film = config.get("film_conditioning", False)
         if use_wavenet:
             dil_str = wavenet_dilations or (1,2,4,8,16,32,64,128,256)
             print(f"  WaveNet branch enabled: dilations={list(dil_str)}")
+        if use_film:
+            print(f"  FiLM conditioning enabled")
 
         cfg = csdi_config["diffusion"]
         self.diffmodel.residual_layers = nn.ModuleList([
@@ -354,6 +415,7 @@ class FinancialScoreNetwork(CSDI_base):
                 is_linear=cfg["is_linear"],
                 wavenet_branch=use_wavenet,
                 wavenet_dilation_rates=wavenet_dilations,
+                film_conditioning=use_film,
             )
             for _ in range(cfg["layers"])
         ])

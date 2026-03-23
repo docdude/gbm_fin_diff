@@ -223,7 +223,15 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
 
     # Generate
     n_gen = config.get("n_generate", 120)
-    generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
+    sampler = config.get("sampler", "pc")
+    if sampler == "karras":
+        generated = model.generate_karras(n_samples=n_gen, seq_len=config["seq_len"])
+    elif sampler == "em":
+        generated = model.generate_em(n_samples=n_gen, seq_len=config["seq_len"])
+    elif sampler == "ode":
+        generated = model.generate_ode(n_samples=n_gen, seq_len=config["seq_len"])
+    else:
+        generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
     np.save(os.path.join(exp_dir, "generated_data.npy"), generated)
 
     # Get ALL real data for comparison (not just n_gen samples)
@@ -380,6 +388,15 @@ def main():
                         help="Save checkpoint every N epochs (default: 100)")
     parser.add_argument("--wavenet-branch", action="store_true",
                         help="Enable parallel WaveNet dilated conv branch in residual blocks")
+    parser.add_argument("--film-conditioning", action="store_true",
+                        help="Enable FiLM noise-level conditioning in residual blocks")
+    parser.add_argument("--spectral-loss", type=float, default=None, metavar="WEIGHT",
+                        help="Enable spectral auxiliary loss with given weight λ (e.g. 0.1)")
+    parser.add_argument("--sampler", type=str, default=None,
+                        choices=["pc", "karras", "em", "ode"],
+                        help="Sampling method for generation (default: pc)")
+    parser.add_argument("--karras-rho", type=float, default=None,
+                        help="Karras sigma schedule exponent ρ (default: 7)")
     parser.add_argument("--warmstart", type=str, default=None,
                         help="Load model weights only (no optimizer/epoch/scheduler). "
                              "Use for warm-starting a new architecture from pretrained weights.")
@@ -420,6 +437,14 @@ def main():
         config["checkpoint_every"] = args.checkpoint_every
     if args.wavenet_branch:
         config["wavenet_branch"] = True
+    if args.film_conditioning:
+        config["film_conditioning"] = True
+    if args.spectral_loss is not None:
+        config["spectral_loss_weight"] = args.spectral_loss
+    if args.sampler:
+        config["sampler"] = args.sampler
+    if args.karras_rho is not None:
+        config["karras_rho"] = args.karras_rho
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)

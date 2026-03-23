@@ -181,7 +181,15 @@ def generate_from_checkpoint(config, checkpoint_path, save_dir):
     model.load(checkpoint_path)
 
     n_gen = config.get("n_generate", 120)
-    generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
+    sampler = config.get("sampler", "pc")
+    if sampler == "karras":
+        generated = model.generate_karras(n_samples=n_gen, seq_len=config["seq_len"])
+    elif sampler == "em":
+        generated = model.generate_em(n_samples=n_gen, seq_len=config["seq_len"])
+    elif sampler == "ode":
+        generated = model.generate_ode(n_samples=n_gen, seq_len=config["seq_len"])
+    else:
+        generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
 
     os.makedirs(save_dir, exist_ok=True)
     np.save(os.path.join(save_dir, "generated_data.npy"), generated)
@@ -214,6 +222,9 @@ def main():
                         help="Path to model checkpoint (for generate/evaluate)")
     parser.add_argument("--save_dir", type=str, default="save/gbm_financial",
                         help="Output directory")
+    parser.add_argument("--sampler", type=str, default=None,
+                        choices=["pc", "karras", "em", "ode"],
+                        help="Sampling method for generation (default: pc)")
     parser.add_argument("--device", type=str, default=None,
                         help="Device (cuda/cpu)")
 
@@ -229,6 +240,8 @@ def main():
             config[key] = val
     if args.use_synthetic:
         config["use_synthetic"] = True
+    if args.sampler:
+        config["sampler"] = args.sampler
     if args.device:
         os.environ["CUDA_VISIBLE_DEVICES"] = "" if args.device == "cpu" else args.device
 

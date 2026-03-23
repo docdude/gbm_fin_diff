@@ -26,6 +26,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim import Adam
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
@@ -171,6 +172,14 @@ class GBMFinancialDiffusion:
             self.loss_weighting = config.get("loss_weighting", "uniform")
         if self.loss_weighting != "uniform":
             print(f"  Loss weighting: {self.loss_weighting}")
+
+        # Spectral auxiliary loss: penalizes differences in log-magnitude
+        # spectrum between denoised prediction x̂_0 and clean data x_0.
+        # Directly targets frequency-domain metrics (QV, roughness).
+        # Weight λ=0 disables it (default).
+        self.spectral_loss_weight = config.get("spectral_loss_weight", 0.0)
+        if self.spectral_loss_weight > 0:
+            print(f"  Spectral auxiliary loss: λ={self.spectral_loss_weight}")
 
         # Optimizer
         self.optimizer = Adam(
@@ -322,6 +331,17 @@ class GBMFinancialDiffusion:
             losses = losses * weights
 
         loss = losses.mean()
+
+        # Spectral auxiliary loss: MSE on log-magnitude FFT of denoised prediction
+        # x̂_0 = x_t - σ · ε_pred  (VE: mean = x_0, so x_t = x_0 + σε)
+        # Targets frequency content directly — QV, roughness, etc.
+        if self.spectral_loss_weight > 0:
+            std_expanded = std.unsqueeze(-1) if std.dim() == 1 else std
+            x0_hat = x_t - std_expanded * eps_pred
+            spec_pred = torch.log1p(torch.fft.rfft(x0_hat, dim=-1).abs())
+            spec_real = torch.log1p(torch.fft.rfft(x_0, dim=-1).abs())
+            spec_loss = F.mse_loss(spec_pred, spec_real)
+            loss = loss + self.spectral_loss_weight * spec_loss
 
         return loss
 
@@ -772,6 +792,111 @@ class GBMFinancialDiffusion:
 
         print(f"Generated {samples.shape[0]} samples of length "
               f"{samples.shape[1]}")
+
+        if self.use_ema:
+            self.ema.restore()
+
+        return samples
+
+    @torch.no_grad()
+    def generate_karras(self, n_samples=120, seq_len=None, batch_size=None):
+        """Generate via Karras/Heun 2nd-order ODE sampler (EDM, Karras et al. 2022).
+
+        Uses power-law sigma schedule with rho=7 and Heun's 2nd-order method.
+        Deterministic (no stochastic noise) — compatible with predictor-only setup.
+        2x NFE vs Euler, but significantly better quality per step.
+
+        The VE probability flow ODE in sigma-space is:
+            dx/dσ = ε_θ(x, σ)
+        Heun's method applies a predictor-corrector trapezoidal rule.
+
+        Args:
+            n_samples: number of sequences to generate
+            seq_len: sequence length
+            batch_size: generation batch size
+        Returns:
+            numpy array of shape (n_samples, seq_len)
+        """
+        if self.use_ema:
+            self.ema.apply_shadow()
+
+        self.model.eval()
+        seq_len = seq_len or self.config["seq_len"]
+        batch_size = batch_size or min(n_samples, 32)
+        N = self.config["n_reverse_steps"]
+        rho = self.config.get("karras_rho", 7)
+        sigma_min = self.sde.sigma_min
+        sigma_max = self.sde.sigma_max
+
+        # Karras power-law sigma schedule (EDM Eq. 5):
+        #   σ_i = (σ_max^(1/ρ) + i/(N-1) · (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
+        # Concentrates steps at low noise where fine structure matters.
+        step_indices = torch.arange(N, dtype=torch.float64)
+        sigmas = (sigma_max ** (1 / rho) +
+                  step_indices / (N - 1) *
+                  (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
+        sigmas = sigmas.float()
+
+        # σ → t mapping for our model (VE exponential schedule):
+        #   σ(t) = σ_min · (σ_max/σ_min)^t  →  t = log(σ/σ_min) / log(σ_max/σ_min)
+        log_ratio = math.log(sigma_max / sigma_min)
+
+        all_samples = []
+        n_remaining = n_samples
+        nfe = 2 * (N - 1)  # Heun uses 2 NFE per step (last step is Euler only)
+
+        print(f"\nGenerating {n_samples} samples "
+              f"(Karras/Heun, N={N}, ρ={rho}, NFE={nfe})...")
+
+        while n_remaining > 0:
+            B = min(batch_size, n_remaining)
+            # Start from prior: N(0, σ_max²)
+            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+
+            for i in tqdm(range(N - 1), desc="Karras/Heun", leave=False,
+                          mininterval=2.0):
+                sigma_cur = sigmas[i].item()
+                sigma_next = sigmas[i + 1].item()
+                h = sigma_next - sigma_cur  # negative (decreasing schedule)
+
+                # Convert σ → t for our model
+                t_cur = math.log(sigma_cur / sigma_min) / log_ratio
+                t_cur = max(min(t_cur, 1.0), 1e-5)
+                t_batch = torch.full((B,), t_cur, device=self.device)
+
+                # Evaluate ε_θ(x, t)  — dx/dσ = ε_θ for VE PF-ODE
+                d_cur = self.model(x, t_batch)
+
+                # Euler predictor step
+                x_hat = x + h * d_cur
+
+                # Heun corrector (2nd order trapezoidal) — skip for last step
+                if i < N - 2:
+                    t_next = math.log(sigma_next / sigma_min) / log_ratio
+                    t_next = max(min(t_next, 1.0), 1e-5)
+                    t_batch_next = torch.full((B,), t_next, device=self.device)
+
+                    d_next = self.model(x_hat, t_batch_next)
+                    x = x + h * 0.5 * (d_cur + d_next)
+                else:
+                    x = x_hat
+
+            all_samples.append(x.cpu().numpy())
+            n_remaining -= B
+
+        samples = np.concatenate(all_samples, axis=0)[:n_samples]
+
+        # Denormalize
+        if self.normalize_mode == "global":
+            samples = samples * self.data_std + self.data_mean
+        elif self.normalize_mode == "per_path" and self.path_means is not None:
+            indices = np.random.randint(0, len(self.path_means),
+                                        size=samples.shape[0])
+            mu = self.path_means[indices]
+            sigma = self.path_stds[indices]
+            samples = samples * sigma[:, None] + mu[:, None]
+
+        print(f"Generated {samples.shape[0]} samples (Karras/Heun)")
 
         if self.use_ema:
             self.ema.restore()
