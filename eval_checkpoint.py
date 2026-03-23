@@ -129,7 +129,7 @@ def main():
         elif args.sampler == "pc":
             suffix = f"pc_snr{args.snr}"
         elif args.sampler == "karras":
-            suffix = f"karras_rho{config.get('karras_rho', 7) if args.karras_rho is None else args.karras_rho}"
+            suffix = f"karras_rho{args.karras_rho or 7}"
         if args.eps is not None:
             suffix += f"_eps{args.eps}"
         args.save_dir = os.path.join(ckpt_dir, f"eval_{suffix}")
