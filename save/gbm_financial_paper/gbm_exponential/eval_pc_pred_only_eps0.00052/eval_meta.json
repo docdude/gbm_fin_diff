@@ -1,0 +1,11 @@
+{
+  "checkpoint": "save/gbm_financial_paper/gbm_exponential/checkpoint_epoch400.pth",
+  "sampler": "pc",
+  "n_reverse": 2000,
+  "snr": 0.16,
+  "corrector_steps": 0,
+  "eps": 0.00052,
+  "n_generate": 60,
+  "sigma_max": 8.285528619289398,
+  "n_real": 2496
+}

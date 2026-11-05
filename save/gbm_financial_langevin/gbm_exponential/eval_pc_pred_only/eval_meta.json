@@ -1,0 +1,10 @@
+{
+  "checkpoint": "save/gbm_financial_langevin/gbm_exponential/best_model.pth",
+  "sampler": "pc",
+  "n_reverse": 2000,
+  "snr": 0.16,
+  "corrector_steps": 0,
+  "n_generate": 60,
+  "sigma_max": 8.96183357477188,
+  "n_real": 5056
+}
