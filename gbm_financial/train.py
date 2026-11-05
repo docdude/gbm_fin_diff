@@ -31,7 +31,7 @@ from torch.optim import Adam
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-from .sde import get_sde, get_sigma, _expand
+from .sde import get_sde, get_sigma, _expand, VPSDE
 from .score_network import FinancialScoreNetwork
 from .metrics import (evaluate_stylized_facts, plot_stylized_facts,
                       plot_diagnostics, plot_pathwise_diagnostics,
@@ -141,6 +141,8 @@ class GBMFinancialDiffusion:
             sigma_min=config["sigma_min"],
             sigma_max=config["sigma_max"],
             N=config["n_reverse_steps"],
+            beta_min=config.get("vp_beta_min", 0.1),
+            beta_max=config.get("vp_beta_max", 20.0),
         )
 
         # Score network — subclasses CSDI_base, applies paper's modifications
@@ -204,12 +206,10 @@ class GBMFinancialDiffusion:
                 self.optimizer, milestones=[p1, p2], gamma=0.1
             )
 
-        # Data mode — with validation
-        self.data_mode = "log_price" if config["sde_type"] == "gbm" else "log_return"
-        if config["sde_type"] == "gbm":
-            print(f"  GBM SDE → data_mode=log_price (cumulative log-returns)")
-        else:
-            print(f"  {config['sde_type'].upper()} SDE → data_mode=log_return (raw log-returns)")
+        # Data mode. Per the paper's author, every SDE trains on log-prices;
+        # 'log_return' is kept only as a legacy option.
+        self.data_mode = config.get("data_mode", "log_price")
+        print(f"  {config['sde_type'].upper()} SDE → data_mode={self.data_mode}")
 
         # Data standardization.
         #
@@ -225,8 +225,8 @@ class GBMFinancialDiffusion:
         # dataset-average path shape).  If scale adjustment is needed,
         # prefer tuning σ_min/σ_max rather than normalizing trajectories.
         #
-        # For VE/VP on raw log-returns: z-score may still be useful since
-        # return distributions are roughly stationary and have no drift.
+        # For VP the prior is N(0, 1), so data must be on unit scale: the
+        # default for VP is a global (scalar) standardisation.
         self.data_mean = 0.0
         self.data_std = 1.0
         # Per-path stats for per_path normalization mode
@@ -242,6 +242,8 @@ class GBMFinancialDiffusion:
         # Support both old normalize_data bool and new normalize_mode string
         if "normalize_mode" in config:
             self.normalize_mode = config["normalize_mode"]
+        elif self._is_vp:
+            self.normalize_mode = "global"
         elif config.get("normalize_data", default_normalize):
             self.normalize_mode = "global"
         else:
@@ -338,6 +340,8 @@ class GBMFinancialDiffusion:
         if self.spectral_loss_weight > 0:
             std_expanded = std.unsqueeze(-1) if std.dim() == 1 else std
             x0_hat = x_t - std_expanded * eps_pred
+            if self._is_vp:
+                x0_hat = x0_hat / _expand(self.sde.mean_coeff(t), x0_hat)
             spec_pred = torch.log1p(torch.fft.rfft(x0_hat, dim=-1).abs())
             spec_real = torch.log1p(torch.fft.rfft(x_0, dim=-1).abs())
             spec_loss = F.mse_loss(spec_pred, spec_real)
@@ -610,385 +614,247 @@ class GBMFinancialDiffusion:
                 n_batches += 1
         return total_loss / max(n_batches, 1)
 
-    @torch.no_grad()
-    def generate(self, n_samples=120, seq_len=None, batch_size=None):
-        """Generate via Predictor-Corrector sampling (score_sde VE default).
+    # ------------------------------------------------------------------
+    # Sampling helpers
+    # ------------------------------------------------------------------
 
-        Predictor: ReverseDiffusion — exact discrete σ² steps via sde.discretize()
-        Corrector: Langevin MCMC — adaptive step size with target SNR
+    @property
+    def _is_vp(self):
+        return isinstance(self.sde, VPSDE)
 
-        This matches score_sde_pytorch's default VE sampler:
-          predictor = reverse_diffusion
-          corrector = langevin
-          snr = 0.16, n_steps_each = 1, noise_removal = True
+    def _eps_and_std(self, x, t_batch):
+        eps_pred = self.model(x, t_batch)
+        _, std = self.sde.marginal_prob(x, t_batch)
+        return eps_pred, _expand(std, eps_pred).clamp(min=1e-8)
 
-        Score_sde PC loop (Song et al. 2021 Algorithm 1):
-          for i in 0..N-1:
-            x, x_mean = corrector(x, t_i)    # Langevin refinement
-            x, x_mean = predictor(x, t_i)    # Reverse diffusion step
-          return x_mean                      # noise removal
+    def _denoise(self, x, t_batch):
+        """Tweedie estimate E[x_0 | x_t] — removes the residual σ(eps) noise.
+
+        Every sampler ends with this step so the output does not depend on
+        sampling_eps (previously eps≥6e-4 left σ_min noise in every point,
+        flipping lag-1 return autocorrelation negative).
         """
+        eps_pred, std = self._eps_and_std(x, t_batch)
+        x0 = x - std * eps_pred
+        if self._is_vp:
+            x0 = x0 / _expand(self.sde.mean_coeff(t_batch), x0)
+        return x0
+
+    def _time_grid(self, N, eps):
+        """Decreasing time grid T → eps with N points.
+
+        VE/GBM: geometric in σ between σ(T) and σ(eps), mapped back through the
+        schedule's exact inverse. Identical to a uniform-t grid for the
+        exponential schedule; for linear/cosine it avoids huge σ jumps at the
+        low-noise end (σ ∝ √t for linear), where daily-return structure lives.
+        VP: uniform in t.
+        """
+        T = self.sde.T
+        if self._is_vp:
+            return torch.linspace(T, eps, N, device=self.device)
+        ends = self.sde._sigma(torch.tensor([float(T), float(eps)]))
+        sig = torch.exp(torch.linspace(math.log(ends[0].item()), math.log(ends[1].item()), N))
+        t = self.sde.t_from_sigma(sig).clamp(min=eps, max=T)
+        t[0], t[-1] = T, eps
+        return t.to(self.device)
+
+    def _begin_sampling(self, seed):
+        if seed is not None:
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         if self.use_ema:
             self.ema.apply_shadow()
-
         self.model.eval()
-        seq_len = seq_len or self.config["seq_len"]
-        batch_size = batch_size or min(n_samples, 32)
-        N = self.config["n_reverse_steps"]  # = sde.N
-        T = self.sde.T
-        eps = self.config.get("sampling_eps", 4e-4)
 
-        # PC sampler parameters
-        snr = self.config.get("pc_snr", 0.16)
-        n_corrector_steps = self.config.get("pc_corrector_steps", 0)
-
-        all_samples = []
-        n_remaining = n_samples
-        nfe = N * (n_corrector_steps + 1)
-
-        print(f"\nGenerating {n_samples} samples "
-              f"(PC sampler, N={N}, snr={snr}, NFE={nfe})...")
-
-        # Pre-move discrete sigmas to device once
-        discrete_sigmas = self.sde.discrete_sigmas.to(self.device)
-
-        while n_remaining > 0:
-            B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
-            timesteps = torch.linspace(T, eps, N, device=self.device)
-
-            for i in tqdm(range(N), desc="PC sampling", leave=False,
-                          mininterval=2.0):
-                t_curr = timesteps[i]
-                t_batch = torch.full((B,), t_curr, device=self.device)
-
-                # === Corrector: Langevin MCMC ===
-                for _ in range(n_corrector_steps):
-                    eps_pred = self.model(x, t_batch)
-                    _, std = self.sde.marginal_prob(x, t_batch)
-                    score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
-
-                    noise = torch.randn_like(x)
-                    grad_norm = torch.norm(
-                        score.reshape(B, -1), dim=-1).mean()
-                    noise_norm = torch.norm(
-                        noise.reshape(B, -1), dim=-1).mean()
-                    # VE: alpha = 1.0 (no scaling)
-                    step_size = (snr * noise_norm / grad_norm) ** 2 * 2
-                    x_mean = x + step_size * score
-                    x = x_mean + torch.sqrt(step_size * 2) * noise
-
-                # === Predictor: Reverse Diffusion ===
-                eps_pred = self.model(x, t_batch)
-                _, std = self.sde.marginal_prob(x, t_batch)
-                score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
-
-                # Discrete VE sigma steps (SMLD discretization)
-                idx = int(t_curr.item() * (N - 1) / T)
-                sigma = discrete_sigmas[idx]
-                adjacent_sigma = (discrete_sigmas[idx - 1]
-                                  if idx > 0
-                                  else torch.zeros_like(sigma))
-                # G = sqrt(σ²_i - σ²_{i-1})
-                G_sq = sigma ** 2 - adjacent_sigma ** 2
-                G = torch.sqrt(G_sq)
-
-                # Reverse step: x_mean = x + G² · score
-                z = torch.randn_like(x)
-                x_mean = x + _expand(G_sq, x) * score
-                x = x_mean + _expand(G, x) * z
-
-            # Noise removal: use denoised x_mean at final step
-            x = x_mean
-
-            all_samples.append(x.cpu().numpy())
-            n_remaining -= B
-
+    def _finish_sampling(self, all_samples, n_samples, label):
         samples = np.concatenate(all_samples, axis=0)[:n_samples]
-
-        # Denormalize back to original data scale
         if self.normalize_mode == "global":
             samples = samples * self.data_std + self.data_mean
         elif self.normalize_mode == "per_path" and self.path_means is not None:
-            indices = np.random.randint(0, len(self.path_means),
-                                        size=samples.shape[0])
-            mu = self.path_means[indices]
-            sigma = self.path_stds[indices]
-            samples = samples * sigma[:, None] + mu[:, None]
-            print(f"  Per-path denorm: sampled {samples.shape[0]} "
-                  f"(mu, sigma) pairs")
-
-        print(f"Generated {samples.shape[0]} samples of length "
-              f"{samples.shape[1]}")
-
+            indices = np.random.randint(0, len(self.path_means), size=samples.shape[0])
+            samples = (samples * self.path_stds[indices][:, None]
+                       + self.path_means[indices][:, None])
+        print(f"Generated {samples.shape[0]} samples of length {samples.shape[1]} ({label})")
         if self.use_ema:
             self.ema.restore()
-
         return samples
 
+    # ------------------------------------------------------------------
+    # Samplers
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
-    def generate_em(self, n_samples=120, seq_len=None, batch_size=None):
-        """Generate via Euler-Maruyama on reverse SDE (legacy sampler).
+    def generate(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
+        """Predictor-Corrector sampler (score_sde VE default), schedule-consistent.
 
-        Kept for comparison. The PC sampler (generate()) is recommended.
+        Predictor: reverse diffusion with G² = σ(t_i)² − σ(t_{i+1})² taken from
+        the configured schedule at the actual time grid (previously it indexed a
+        geometric σ table, which was wrong for cosine/linear schedules).
+        The final step goes to σ=0, i.e. a Tweedie denoise.
+        Corrector: optional Langevin MCMC (pc_corrector_steps, pc_snr).
+
+        VP models are routed to the Euler–Maruyama sampler.
         """
-        if self.use_ema:
-            self.ema.apply_shadow()
+        if self._is_vp:
+            return self.generate_em(n_samples, seq_len, batch_size, seed=seed)
 
-        self.model.eval()
+        self._begin_sampling(seed)
         seq_len = seq_len or self.config["seq_len"]
         batch_size = batch_size or min(n_samples, 32)
         N = self.config["n_reverse_steps"]
-        T = self.sde.T
-        eps = 1e-3
+        eps = self.config.get("sampling_eps", 1e-5)
+        snr = self.config.get("pc_snr", 0.16)
+        n_corrector_steps = self.config.get("pc_corrector_steps", 0)
 
-        all_samples = []
-        n_remaining = n_samples
+        print(f"\nGenerating {n_samples} samples (PC sampler, N={N}, "
+              f"schedule={self.sde.schedule}, corrector_steps={n_corrector_steps})...")
 
-        print(f"\nGenerating {n_samples} samples (EM, N={N} steps)...")
+        timesteps = self._time_grid(N, eps)
+        sigmas = self.sde._sigma(timesteps)
+        sigmas_next = torch.cat([sigmas[1:], torch.zeros(1, device=self.device)])
 
+        all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling((B, seq_len)).to(self.device)
-            timesteps = torch.linspace(T, eps, N, device=self.device)
 
-            for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False,
-                          mininterval=2.0):
-                t_curr = timesteps[i]
-                t_next = timesteps[i + 1]
-                dt = t_next - t_curr  # negative
+            for i in tqdm(range(N), desc="PC sampling", leave=False, mininterval=2.0):
+                t_batch = torch.full((B,), timesteps[i].item(), device=self.device)
+                sigma = sigmas[i]
 
-                t_batch = torch.full((B,), t_curr, device=self.device)
-                eps_pred = self.model(x, t_batch)
-                _, std = self.sde.marginal_prob(x, t_batch)
-                score = -eps_pred / _expand(std, eps_pred).clamp(min=1e-8)
-
-                drift, diffusion = self.sde.sde(x, t_batch)
-                g_sq = _expand(diffusion, x) ** 2
-                g = _expand(diffusion, x)
-
-                rev_drift = drift - g_sq * score
-                x_mean = x + rev_drift * dt
-
-                if i < N - 2:
+                for _ in range(n_corrector_steps):
+                    eps_pred = self.model(x, t_batch)
+                    score = -eps_pred / sigma
                     noise = torch.randn_like(x)
-                    x = x_mean + g * torch.sqrt(torch.abs(dt)) * noise
+                    grad_norm = torch.norm(score.reshape(B, -1), dim=-1).mean()
+                    noise_norm = torch.norm(noise.reshape(B, -1), dim=-1).mean()
+                    step_size = (snr * noise_norm / grad_norm) ** 2 * 2
+                    x = x + step_size * score + torch.sqrt(step_size * 2) * noise
+
+                eps_pred = self.model(x, t_batch)
+                score = -eps_pred / sigma
+                g_sq = sigma ** 2 - sigmas_next[i] ** 2
+                x_mean = x + g_sq * score
+                if i < N - 1:
+                    x = x_mean + torch.sqrt(g_sq) * torch.randn_like(x)
                 else:
                     x = x_mean
 
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
-        samples = np.concatenate(all_samples, axis=0)[:n_samples]
-
-        if self.normalize_mode == "global":
-            samples = samples * self.data_std + self.data_mean
-        elif self.normalize_mode == "per_path" and self.path_means is not None:
-            indices = np.random.randint(0, len(self.path_means),
-                                        size=samples.shape[0])
-            mu = self.path_means[indices]
-            sigma = self.path_stds[indices]
-            samples = samples * sigma[:, None] + mu[:, None]
-
-        print(f"Generated {samples.shape[0]} samples of length "
-              f"{samples.shape[1]}")
-
-        if self.use_ema:
-            self.ema.restore()
-
-        return samples
+        return self._finish_sampling(all_samples, n_samples, "PC")
 
     @torch.no_grad()
-    def generate_karras(self, n_samples=120, seq_len=None, batch_size=None):
-        """Generate via Karras/Heun 2nd-order ODE sampler (EDM, Karras et al. 2022).
+    def generate_em(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
+        """Euler–Maruyama on the reverse SDE (works for VE/GBM and VP),
+        followed by a final Tweedie denoise at t=eps."""
+        self._begin_sampling(seed)
+        seq_len = seq_len or self.config["seq_len"]
+        batch_size = batch_size or min(n_samples, 32)
+        N = self.config["n_reverse_steps"]
+        eps = self.config.get("sampling_eps", 1e-5)
 
-        Uses power-law sigma schedule with rho=7 and Heun's 2nd-order method.
-        Deterministic (no stochastic noise) — compatible with predictor-only setup.
-        2x NFE vs Euler, but significantly better quality per step.
+        print(f"\nGenerating {n_samples} samples (EM, N={N} steps)...")
 
-        The VE probability flow ODE in sigma-space is:
-            dx/dσ = ε_θ(x, σ)
-        Heun's method applies a predictor-corrector trapezoidal rule.
+        timesteps = self._time_grid(N, eps)
+        all_samples, n_remaining = [], n_samples
+        while n_remaining > 0:
+            B = min(batch_size, n_remaining)
+            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
 
-        Args:
-            n_samples: number of sequences to generate
-            seq_len: sequence length
-            batch_size: generation batch size
-        Returns:
-            numpy array of shape (n_samples, seq_len)
+            for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False, mininterval=2.0):
+                dt = timesteps[i + 1] - timesteps[i]  # negative
+                t_batch = torch.full((B,), timesteps[i].item(), device=self.device)
+                eps_pred, std = self._eps_and_std(x, t_batch)
+                score = -eps_pred / std
+                drift, diffusion = self.sde.sde(x, t_batch)
+                g = _expand(diffusion, x)
+                x = x + (drift - g ** 2 * score) * dt + g * torch.sqrt(-dt) * torch.randn_like(x)
+
+            x = self._denoise(x, torch.full((B,), eps, device=self.device))
+            all_samples.append(x.cpu().numpy())
+            n_remaining -= B
+
+        return self._finish_sampling(all_samples, n_samples, "EM")
+
+    @torch.no_grad()
+    def generate_karras(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
+        """Karras/Heun 2nd-order PF-ODE sampler (EDM) for VE/GBM models.
+
+        σ_i follows the EDM power-law grid; each σ is mapped back to the
+        network's time variable with the schedule's exact inverse
+        (sde.t_from_sigma) — previously hard-coded to the exponential schedule.
+        Ends with a Tweedie denoise at σ_min.
         """
-        if self.use_ema:
-            self.ema.apply_shadow()
+        if self._is_vp:
+            raise ValueError("Karras sampler is only implemented for VE/GBM SDEs")
 
-        self.model.eval()
+        self._begin_sampling(seed)
         seq_len = seq_len or self.config["seq_len"]
         batch_size = batch_size or min(n_samples, 32)
         N = self.config["n_reverse_steps"]
         rho = self.config.get("karras_rho", 7)
-        sigma_min = self.sde.sigma_min
-        sigma_max = self.sde.sigma_max
+        sigma_min, sigma_max = self.sde.sigma_min, self.sde.sigma_max
 
-        # Karras power-law sigma schedule (EDM Eq. 5):
-        #   σ_i = (σ_max^(1/ρ) + i/(N-1) · (σ_min^(1/ρ) - σ_max^(1/ρ)))^ρ
-        # Concentrates steps at low noise where fine structure matters.
-        step_indices = torch.arange(N, dtype=torch.float64)
-        sigmas = (sigma_max ** (1 / rho) +
-                  step_indices / (N - 1) *
+        step = torch.arange(N, dtype=torch.float64)
+        sigmas = (sigma_max ** (1 / rho) + step / (N - 1) *
                   (sigma_min ** (1 / rho) - sigma_max ** (1 / rho))) ** rho
-        sigmas = sigmas.float()
+        sigmas = sigmas.float().to(self.device)
+        ts = self.sde.t_from_sigma(sigmas).to(self.device)
 
-        # σ → t mapping for our model (VE exponential schedule):
-        #   σ(t) = σ_min · (σ_max/σ_min)^t  →  t = log(σ/σ_min) / log(σ_max/σ_min)
-        log_ratio = math.log(sigma_max / sigma_min)
+        print(f"\nGenerating {n_samples} samples (Karras/Heun, N={N}, ρ={rho}, "
+              f"schedule={self.sde.schedule})...")
 
-        all_samples = []
-        n_remaining = n_samples
-        nfe = 2 * (N - 1)  # Heun uses 2 NFE per step (last step is Euler only)
-
-        print(f"\nGenerating {n_samples} samples "
-              f"(Karras/Heun, N={N}, ρ={rho}, NFE={nfe})...")
-
+        all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            # Start from prior: N(0, σ_max²)
             x = self.sde.prior_sampling((B, seq_len)).to(self.device)
 
-            for i in tqdm(range(N - 1), desc="Karras/Heun", leave=False,
-                          mininterval=2.0):
-                sigma_cur = sigmas[i].item()
-                sigma_next = sigmas[i + 1].item()
-                h = sigma_next - sigma_cur  # negative (decreasing schedule)
-
-                # Convert σ → t for our model
-                t_cur = math.log(sigma_cur / sigma_min) / log_ratio
-                t_cur = max(min(t_cur, 1.0), 1e-5)
-                t_batch = torch.full((B,), t_cur, device=self.device)
-
-                # Evaluate ε_θ(x, t)  — dx/dσ = ε_θ for VE PF-ODE
-                d_cur = self.model(x, t_batch)
-
-                # Euler predictor step
+            for i in tqdm(range(N - 1), desc="Karras/Heun", leave=False, mininterval=2.0):
+                h = sigmas[i + 1] - sigmas[i]
+                d_cur = self.model(x, torch.full((B,), ts[i].item(), device=self.device))
                 x_hat = x + h * d_cur
+                d_next = self.model(x_hat, torch.full((B,), ts[i + 1].item(), device=self.device))
+                x = x + h * 0.5 * (d_cur + d_next)
 
-                # Heun corrector (2nd order trapezoidal) — skip for last step
-                if i < N - 2:
-                    t_next = math.log(sigma_next / sigma_min) / log_ratio
-                    t_next = max(min(t_next, 1.0), 1e-5)
-                    t_batch_next = torch.full((B,), t_next, device=self.device)
-
-                    d_next = self.model(x_hat, t_batch_next)
-                    x = x + h * 0.5 * (d_cur + d_next)
-                else:
-                    x = x_hat
-
+            x = self._denoise(x, torch.full((B,), ts[-1].item(), device=self.device))
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
-        samples = np.concatenate(all_samples, axis=0)[:n_samples]
-
-        # Denormalize
-        if self.normalize_mode == "global":
-            samples = samples * self.data_std + self.data_mean
-        elif self.normalize_mode == "per_path" and self.path_means is not None:
-            indices = np.random.randint(0, len(self.path_means),
-                                        size=samples.shape[0])
-            mu = self.path_means[indices]
-            sigma = self.path_stds[indices]
-            samples = samples * sigma[:, None] + mu[:, None]
-
-        print(f"Generated {samples.shape[0]} samples (Karras/Heun)")
-
-        if self.use_ema:
-            self.ema.restore()
-
-        return samples
+        return self._finish_sampling(all_samples, n_samples, "Karras/Heun")
 
     @torch.no_grad()
-    def generate_ode(self, n_samples=120, seq_len=None, batch_size=None):
-        """Generate via probability flow ODE (deterministic, no stochastic noise).
-
-        Probability flow ODE (Song et al. 2021, Eq. 6):
-            dX = [f(X,t) - ½ g²(t) · score(X,t)] dt
-
-        Advantages over reverse SDE:
-          - No noise accumulation → much sharper outputs
-          - Better for undertrained models (no noise to counterbalance)
-          - Deterministic given the initial noise sample
-
-        Args:
-            n_samples: number of sequences to generate
-            seq_len: sequence length
-            batch_size: generation batch size
-        Returns:
-            numpy array of shape (n_samples, seq_len)
-        """
-        if self.use_ema:
-            self.ema.apply_shadow()
-
-        self.model.eval()
+    def generate_ode(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
+        """Probability-flow ODE (Euler), dX = [f − ½g²·score] dt, followed by
+        a final Tweedie denoise at t=eps. Works for VE/GBM and VP."""
+        self._begin_sampling(seed)
         seq_len = seq_len or self.config["seq_len"]
         batch_size = batch_size or min(n_samples, 32)
         N = self.config["n_reverse_steps"]
-        T = self.sde.T
-        eps = 1e-3
-
-        all_samples = []
-        n_remaining = n_samples
+        eps = self.config.get("sampling_eps", 1e-5)
 
         print(f"\nGenerating {n_samples} samples (ODE, N={N} steps)...")
 
+        timesteps = self._time_grid(N, eps)
+        all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling((B, seq_len)).to(self.device)
 
-            timesteps = torch.linspace(T, eps, N, device=self.device)
-
             for i in tqdm(range(N - 1), desc="PF-ODE", leave=False, mininterval=2.0):
-                t_curr = timesteps[i]
-                t_next = timesteps[i + 1]
-                dt = t_next - t_curr  # negative
-
-                t_batch = torch.full((B,), t_curr, device=self.device)
-
-                # Noise prediction → score
-                eps_pred = self.model(x, t_batch)
-                _, std = self.sde.marginal_prob(x, t_batch)
-                if std.dim() == 1:
-                    score = -eps_pred / std.unsqueeze(-1).clamp(min=1e-8)
-                else:
-                    score = -eps_pred / std.clamp(min=1e-8)
-
-                # SDE coefficients
+                dt = timesteps[i + 1] - timesteps[i]
+                t_batch = torch.full((B,), timesteps[i].item(), device=self.device)
+                eps_pred, std = self._eps_and_std(x, t_batch)
+                score = -eps_pred / std
                 drift, diffusion = self.sde.sde(x, t_batch)
-                if diffusion.dim() == 1:
-                    g_sq = diffusion.pow(2).unsqueeze(-1)
-                else:
-                    g_sq = diffusion.pow(2)
+                x = x + (drift - 0.5 * _expand(diffusion, x) ** 2 * score) * dt
 
-                # PF-ODE: dX = [f - ½ g² · score] dt  (NO noise term)
-                ode_drift = drift - 0.5 * g_sq * score
-                x = x + ode_drift * dt
-
+            x = self._denoise(x, torch.full((B,), eps, device=self.device))
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
-        samples = np.concatenate(all_samples, axis=0)[:n_samples]
-
-        # Denormalize
-        if self.normalize_mode == "global":
-            samples = samples * self.data_std + self.data_mean
-        elif self.normalize_mode == "per_path" and self.path_means is not None:
-            indices = np.random.randint(0, len(self.path_means), size=samples.shape[0])
-            mu = self.path_means[indices]
-            sigma = self.path_stds[indices]
-            samples = samples * sigma[:, None] + mu[:, None]
-
-        print(f"Generated {samples.shape[0]} samples (ODE)")
-
-        if self.use_ema:
-            self.ema.restore()
-
-        return samples
+        return self._finish_sampling(all_samples, n_samples, "ODE")
 
     def evaluate(self, generated_data, real_data=None, save_dir=None):
         """Evaluate generated data against stylized facts.

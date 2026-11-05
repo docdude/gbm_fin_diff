@@ -33,7 +33,8 @@ pip install yfinance
 
 - Python ≥ 3.9
 - PyTorch ≥ 1.12
-- NumPy, SciPy, Matplotlib, pandas, tqdm, PyYAML
+- NumPy, SciPy, Matplotlib, pandas, tqdm, PyYAML, TensorBoard
+- Optional: yfinance (download), scikit-learn + pyarrow + arch (comparison harness)
 
 ## Quick Start
 
@@ -43,11 +44,39 @@ pip install yfinance
 python -m gbm_financial.validate
 ```
 
-Runs 5 diagnostic tests: oracle score, tensor shapes, loss convergence, noise prediction quality, and generation scale.
+Runs 6 diagnostic tests: oracle score, tensor shapes, loss convergence, noise prediction quality, generation scale, and a sampler oracle that checks every sampler × SDE × schedule against an exact Gaussian score (`--test samplers`).
+
+### Full run + head-to-head comparison on one GPU
+
+```bash
+pip install -e ".[download,compare]"
+bash scripts/l40s_pipeline.sh                  # ours vs vnhtg01, shared harness
+RUN_ABLATION=1 bash scripts/l40s_pipeline.sh   # + paper σ_min=0.01 ablation
+```
+
+Auto-selects an L40S (override with `GPU=<index>`), is resumable, and writes
+`save/comparison/REPORT.md`. Copy `data/financial/sp500_prices_raw.pkl` to the
+training machine to train on identical data (otherwise it is downloaded).
+
+### Compare any generator with the shared harness
+
+```bash
+python -m gbm_financial.compare --real save/fixed/gbm_exponential/real_train.npy \
+    --holdout save/fixed/gbm_exponential/real_val.npy --input log_price \
+    --gen ours=save/fixed/gbm_exponential/generated_seed0.npy,save/fixed/gbm_exponential/generated_seed1.npy \
+    --baselines --out save/comparison/custom
+```
+
+All metrics are computed within windows (generated windows are independent),
+averaged over sampling seeds, and reported next to iid-shuffle, block-bootstrap
+and GARCH(1,1)-t baselines plus a held-out-ticker "real vs real" row.
 
 ### Train on S&P 500 data
 
 ```bash
+# Paper architecture, GBM + exponential, multi-seed evaluation
+python -m gbm_financial.train_l4 --save_dir save/fixed
+
 # Default: GBM SDE + exponential schedule, 1000 epochs
 python -m gbm_financial.run
 
@@ -70,7 +99,8 @@ gbm_fin_diff/
 ├── gbm_financial/
 │   ├── __init__.py
 │   ├── config.yaml          # Default hyperparameters (paper Section 4)
-│   ├── data.py              # Data pipeline: S&P 500 CSV → sliding windows
+│   ├── compare.py           # Shared comparison harness + baselines
+│   ├── data.py              # Data pipeline: raw prices → sliding windows
 │   ├── metrics.py           # Stylized facts: Hill estimator, ACF, plots
 │   ├── run.py               # CLI entry point
 │   ├── score_network.py     # Score network (CSDI_base subclass)
@@ -96,7 +126,7 @@ All hyperparameters are in [`gbm_financial/config.yaml`](gbm_financial/config.ya
 |-----------|---------|-----------------|
 | `sde_type` | `gbm` | Section 3.1 |
 | `schedule` | `exponential` | Section 3.1 |
-| `sigma_min` | 0.01 | Section 4 |
+| `sigma_min` | 0.001 (`train_l4`) | Section 4 uses 0.01 — see notes below |
 | `sigma_max` | 1.0 | Section 4 |
 | `n_reverse_steps` | 2000 | Section 4 |
 | `channels` | 128 | Section 3.1.1 |
@@ -114,7 +144,17 @@ $$dx = \sigma(t) \, dw, \quad \sigma(t) = \sigma_{\min} \left(\frac{\sigma_{\max
 
 $$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left[ \left\| s_\theta(x_t, t) + \frac{\epsilon}{\sigma(t)} \right\|^2 \right]$$
 
-**Sampling**: Reverse-time SDE solved with Euler-Maruyama (N=2000 steps).
+**Sampling**: predictor-corrector (default), Euler–Maruyama, probability-flow ODE, or Karras/Heun, N=2000 steps. VE/GBM samplers step on a grid geometric in σ mapped through each schedule's exact inverse, and every sampler ends with a Tweedie denoise, so results no longer depend on `sampling_eps`.
+
+### Implementation notes (deviations and clarifications)
+
+- **Data representation:** every SDE trains on anchored log-price windows (`data_mode="log_price"`), as confirmed by the paper's author. Log-returns are used only for evaluation. `data_mode="log_return"` remains available as a legacy option.
+- **GBM ≡ VE in log-price space:** with μ_t = ½σ_t² the GBM forward SDE is exactly the VE SDE, so on identical data the two are the same model. `GBMSDE` is kept as a separate class for bookkeeping only.
+- **VP schedules:** β(t) = σ(t)² (author's parameterisation), with σ_VP ∈ [√β_min, √β_max] = [√0.1, √20]. The linear schedule reproduces the standard Song et al. VP SDE. VP data is globally standardised because its prior is N(0, 1).
+- **σ_min = 1e-3 instead of 0.01:** on log-price paths, 0.01 is about one daily return (std ≈ 0.017), so the network never learned sub-daily structure. Use `--sigma_min 0.01` to reproduce the paper.
+- **Raw prices:** `data/financial/sp500_prices_raw.pkl` stores unprocessed closes. Only one-day spike-and-revert bad ticks are repaired; real crashes (1987, AIG 2008, …) are kept. The legacy `sp500_prices.pkl` cache zeroed every return beyond 5σ and is ignored.
+- **Validation split:** whole tickers are held out (`split="ticker"`), so overlapping windows cannot leak between train and validation.
+- **Tail exponent:** α is a Hill estimate on the top 5% of |r|. The older √n-k estimate is still reported as `alpha_hill_sqrtn`.
 
 ## Vendored Dependencies
 

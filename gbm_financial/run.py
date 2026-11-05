@@ -70,6 +70,7 @@ def run_single_experiment(config, save_dir):
         min_years=config.get("min_years", 40),
         cache_dir=os.path.join(save_dir, "data"),
         num_workers=0,
+        data_mode=config.get("data_mode", "log_price"),
     )
     print(f"Data: {data_info['n_train']} train, {data_info['n_val']} val sequences")
     print(f"  mode={data_info['mode']}, seq_len={data_info['seq_len']}")
@@ -265,8 +266,7 @@ def main():
             print(f"ERROR: No generated data found at {data_path}")
             sys.exit(1)
         data = np.load(data_path)
-        mode = "log_price" if config["sde_type"] == "gbm" else "log_return"
-        evaluate_stylized_facts(data, mode=mode)
+        evaluate_stylized_facts(data, mode=config.get("data_mode", "log_price"))
 
 
 if __name__ == "__main__":

@@ -4,7 +4,7 @@ Stylized facts evaluation metrics for generated financial time series.
 Implements the three key metrics from Section 4 of arXiv:2507.19003,
 following the methodology of Takahashi et al. (2019) [ref 7 in paper]:
 
-  (i)   Heavy-tail exponent α via Hill estimator
+  (i)   Heavy-tail exponent α via Hill estimator on the top 5% of |r|
         - P(r) ~ |r|^{-α}, empirical S&P 500: α ≈ 4.35
         - α is dataset-specific: the goal is generated α ≈ real α
 
@@ -71,7 +71,7 @@ def hill_estimator(abs_returns_sorted_desc, k):
 
 
 def compute_heavy_tail_exponent(returns, method="hill", n_bins=100,
-                                tail_fraction=0.15):
+                                tail_fraction=0.15, hill_tail_fraction=0.05):
     """Estimate the tail exponent α of the return distribution.
 
     Two methods available:
@@ -89,8 +89,12 @@ def compute_heavy_tail_exponent(returns, method="hill", n_bins=100,
         method: 'hill' or 'loglog'
         n_bins: bins for loglog method
         tail_fraction: fraction of data for loglog method
+        hill_tail_fraction: fraction of |r| used by the primary Hill estimate
+            (0.05 = top 5%, the convention behind the paper's α≈4.35)
     Returns:
-        dict with 'alpha', 'alpha_pos', 'alpha_neg', and plotting data
+        dict with 'alpha' (Hill, top hill_tail_fraction), 'alpha_hill_sqrtn'
+        (legacy: median Hill around k=√n — probes only the extreme ~0.1% and
+        is very noisy), 'alpha_pos', 'alpha_neg', and plotting data
     """
     returns = returns.flatten()
     abs_returns = np.abs(returns)
@@ -115,12 +119,11 @@ def compute_heavy_tail_exponent(returns, method="hill", n_bins=100,
         alphas = [hill_estimator(sorted_abs, k) for k in k_range]
         valid = [(k, a) for k, a in zip(k_range, alphas) if not np.isnan(a)]
 
-        if valid:
-            alpha_values = [a for _, a in valid]
-            result["alpha"] = np.median(alpha_values)
-            result["hill_k_used"] = k_default
-        else:
-            result["alpha"] = np.nan
+        result["alpha_hill_sqrtn"] = (np.median([a for _, a in valid])
+                                      if valid else np.nan)
+        k_main = max(10, int(hill_tail_fraction * n))
+        result["alpha"] = hill_estimator(sorted_abs, min(k_main, n - 1))
+        result["hill_k_used"] = k_main
 
         # Separate tails
         pos_returns = returns[returns > 0]
@@ -128,8 +131,8 @@ def compute_heavy_tail_exponent(returns, method="hill", n_bins=100,
         for label, tail_data in [("pos", pos_returns), ("neg", neg_returns)]:
             if len(tail_data) > 50:
                 sorted_tail = np.sort(tail_data)[::-1]
-                k_tail = max(10, int(np.sqrt(len(sorted_tail))))
-                k_tail = min(k_tail, len(sorted_tail) // 4)
+                k_tail = max(10, int(hill_tail_fraction * len(sorted_tail)))
+                k_tail = min(k_tail, len(sorted_tail) - 1)
                 result[f"alpha_{label}"] = hill_estimator(sorted_tail, k_tail)
             else:
                 result[f"alpha_{label}"] = np.nan

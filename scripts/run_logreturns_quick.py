@@ -22,7 +22,7 @@ from gbm_financial.metrics import (evaluate_stylized_facts, plot_diagnostics,
                                    plot_mean_path_diagnostic)
 
 CONFIG = {
-    # VE SDE = GBM in log-space, routes to data_mode="log_return" automatically
+    # VE SDE on raw log-returns (data_mode="log_return", set explicitly below)
     "sde_type": "ve",
     "schedule": "exponential",
     "sigma_min": 0.01,
@@ -68,9 +68,11 @@ def main():
     print("VE SDE on raw log-returns | sigma_max=1.0 | CPU")
     print("=" * 60)
 
-    # Data — sde_type="ve" → mode="log_return" automatically
+    # Legacy experiment: VE on raw log-returns (must be requested explicitly)
+    CONFIG["data_mode"] = "log_return"
     train_loader, val_loader, data_info = get_dataloaders(
         sde_type="ve",
+        data_mode="log_return",
         window_len=CONFIG["seq_len"],
         stride=CONFIG["stride"],
         batch_size=CONFIG["batch_size"],

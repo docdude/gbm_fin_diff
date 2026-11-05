@@ -43,10 +43,14 @@ from gbm_financial.metrics import (compute_pathwise_diagnostics,
                                    plot_diagnostics,
                                    plot_pathwise_diagnostics,
                                    plot_mean_path_diagnostic)
+from gbm_financial.compare import to_returns, run_comparison, format_report
 
 
-def quick_scalar_comparison(gen, real, label=""):
-    """Key scalar metrics for quick comparison."""
+def quick_scalar_comparison(gen, real, label="", mode="log_price"):
+    """Key scalar metrics for quick comparison (paths built from returns if needed)."""
+    if mode == "log_return":
+        real = np.cumsum(real, axis=1)
+        gen = np.cumsum(gen, axis=1)
     ret_r = compute_log_returns(real, mode="log_price")
     ret_g = compute_log_returns(gen, mode="log_price")
 
@@ -112,12 +116,15 @@ def main():
     parser.add_argument("--corrector-steps", type=int, default=0,
                         help="Langevin corrector steps per predictor step (0 = predictor-only)")
     parser.add_argument("--eps", type=float, default=None,
-                        help="Sampling epsilon (min noise level). PC default=1e-5, EM default=1e-3")
+                        help="Sampling epsilon (smallest diffusion time; all samplers end "
+                             "with a Tweedie denoise there). Default: config sampling_eps or 1e-5")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--stride", type=int, default=None,
                         help="Override data stride (default: from checkpoint config)")
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip generating plot files")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="Sampling seed (logged for reproducibility)")
     args = parser.parse_args()
 
     # Resolve save dir
@@ -159,6 +166,13 @@ def main():
             config[key] = ckpt_config[key]
             print(f"  Merged '{key}={ckpt_config[key]}' from checkpoint config")
 
+    # Checkpoints trained before data_mode existed: GBM used log-prices,
+    # VE/VP used log-returns.
+    if "data_mode" not in config:
+        config["data_mode"] = "log_price" if config.get("sde_type") == "gbm" else "log_return"
+        print(f"  Legacy checkpoint: data_mode={config['data_mode']}")
+    mode = config["data_mode"]
+
     # Override sampling params
     config["n_reverse_steps"] = args.n_reverse
     config["pc_snr"] = args.snr
@@ -180,9 +194,12 @@ def main():
         batch_size=config.get("batch_size", 64),
         min_years=config.get("min_years", 40),
         num_workers=2,
+        data_mode=mode,
+        split=config.get("split", "ticker"),
+        seed=config.get("seed", 0),
     )
 
-    # σ_max: prefer saved numeric value from checkpoint/config (deterministic).
+    # σ_max: prefer saved numeric value (VP does not use σ_max) from checkpoint/config (deterministic).
     # Only recompute from data if missing or set to "auto".
     saved_sigma = config.get("sigma_max")
     if isinstance(saved_sigma, (int, float)) and saved_sigma > 0:
@@ -192,8 +209,9 @@ def main():
         config["sigma_max"] = sigma_max
         print(f"σ_max (auto-computed) = {sigma_max:.2f}")
 
-    # Gather real data
-    real_data = np.concatenate([b.numpy() for b in train_loader], axis=0)
+    # Gather real data (training reference + held-out windows)
+    real_data = train_loader.dataset.data.numpy()
+    holdout_data = val_loader.dataset.data.numpy()
     print(f"Real data: {real_data.shape}")
 
     # Load model
@@ -210,43 +228,55 @@ def main():
             sampler_label = "PC (predictor-only)"
         else:
             sampler_label = f"PC (snr={args.snr}, corr_steps={args.corrector_steps})"
-        generated = model.generate(n_samples=args.n_generate,
+        generated = model.generate(n_samples=args.n_generate, seed=args.seed,
                                    seq_len=window_len,
                                    batch_size=args.batch_size)
     elif args.sampler == "em":
-        generated = model.generate_em(n_samples=args.n_generate,
+        generated = model.generate_em(n_samples=args.n_generate, seed=args.seed,
                                       seq_len=window_len,
                                       batch_size=args.batch_size)
     elif args.sampler == "ode":
-        generated = model.generate_ode(n_samples=args.n_generate,
+        generated = model.generate_ode(n_samples=args.n_generate, seed=args.seed,
                                        seq_len=window_len,
                                        batch_size=args.batch_size)
     elif args.sampler == "karras":
         sampler_label = f"Karras/Heun (ρ={config.get('karras_rho', 7)})"
-        generated = model.generate_karras(n_samples=args.n_generate,
+        generated = model.generate_karras(n_samples=args.n_generate, seed=args.seed,
                                           seq_len=window_len,
                                           batch_size=args.batch_size)
 
     np.save(os.path.join(args.save_dir, "generated_data.npy"), generated)
 
     # Scalar metrics
-    scalar_metrics = quick_scalar_comparison(generated, real_data, f"({sampler_label})")
+    scalar_metrics = quick_scalar_comparison(generated, real_data, f"({sampler_label})", mode=mode)
+
+    # Shared comparison harness (same metrics used for cross-repo comparisons)
+    label = f"{config.get('sde_type')}+{config.get('schedule')} seed{args.seed}"
+    harness = run_comparison(to_returns(real_data, mode),
+                             {label: [to_returns(generated, mode)]},
+                             holdout_r=to_returns(holdout_data, mode), baselines=False)
+    table = format_report(harness)
+    print("\n" + table)
+    with open(os.path.join(args.save_dir, f"comparison_seed{args.seed}.md"), "w") as f:
+        f.write(table + "\n")
+    harness_metrics = {k: v["mean"] for k, v in harness[label].items()}
 
     # Pathwise diagnostics
-    gen_pw = compute_pathwise_diagnostics(generated, mode="log_price")
-    real_pw = compute_pathwise_diagnostics(real_data, mode="log_price")
+    paths_gen = generated if mode == "log_price" else np.cumsum(generated, axis=1)
+    paths_real = real_data if mode == "log_price" else np.cumsum(real_data, axis=1)
+    gen_pw = compute_pathwise_diagnostics(paths_gen, mode="log_price")
+    real_pw = compute_pathwise_diagnostics(paths_real, mode="log_price")
     print_pathwise_summary(gen_pw, real_pw)
 
     # Distribution distances (KS + Wasserstein)
     dist_distances = compute_distribution_distances(
-        gen_pw, real_pw, gen_data=generated, real_data=real_data)
+        gen_pw, real_pw, gen_data=paths_gen, real_data=paths_real)
     print_distribution_distances(dist_distances)
 
     # Stylized facts + plots
     gen_results, real_results = model.evaluate(generated, real_data, save_dir=args.save_dir)
 
     if not args.no_plots:
-        mode = "log_price" if config.get("sde_type") == "gbm" else "log_return"
         plot_diagnostics(generated, real_data, mode=mode,
                          save_path=os.path.join(args.save_dir, "diagnostics.png"))
         plot_pathwise_diagnostics(generated, real_data, mode=mode,
@@ -265,6 +295,8 @@ def main():
         "n_generate": args.n_generate,
         "sigma_max": config["sigma_max"],
         "n_real": real_data.shape[0],
+        "seed": args.seed,
+        "data_mode": mode,
     }
     with open(os.path.join(args.save_dir, "eval_meta.json"), "w") as f:
         json.dump(eval_meta, f, indent=2)
@@ -280,6 +312,9 @@ def main():
         "n_reverse": args.n_reverse,
         "n_generate": args.n_generate,
         "sigma_max": config["sigma_max"],
+        "sigma_min": config.get("sigma_min"),
+        "seed": args.seed,
+        "data_mode": mode,
         "save_dir": args.save_dir,
     }
     # Scalar metrics (real, gen, ratio)
@@ -313,6 +348,11 @@ def main():
     log_record["beta_real"] = float(real_results["volatility_clustering"]["beta"]) if real_results else None
     lev = gen_results["leverage_effect"]["leverage_correlation"]
     log_record["leverage_L1_gen"] = float(lev[1]) if len(lev) > 1 else None
+    lev_r = real_results["leverage_effect"]["leverage_correlation"]
+    log_record["leverage_L1_real"] = float(lev_r[1]) if len(lev_r) > 1 else None
+    # Harness metrics (α on top-5% tail, within-window ACF/leverage, memorisation…)
+    for k, v in harness_metrics.items():
+        log_record[f"h_{k}"] = v
     # Distribution distances
     for dist_name, dist_vals in dist_distances.items():
         log_record[f"ks_{dist_name}"] = dist_vals["ks_stat"]

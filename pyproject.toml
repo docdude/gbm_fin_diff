@@ -21,10 +21,12 @@ dependencies = [
     "tqdm>=4.62",
     "pyyaml>=5.4",
     "pandas>=1.3",
+    "tensorboard>=2.10",
 ]
 
 [project.optional-dependencies]
 download = ["yfinance>=0.2"]
+compare = ["scikit-learn>=1.2", "pyarrow>=12", "arch>=6.0"]
 attention = ["linear-attention-transformer>=0.19"]
 dev = ["pytest>=7.0"]
 

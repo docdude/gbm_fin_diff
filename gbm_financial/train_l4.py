@@ -2,12 +2,14 @@
 """
 L4 GPU training script for GBM Financial Diffusion Model.
 
-Designed for Lightning AI Studio with L4 GPU (24GB VRAM).
+Runs on any single ~24-48 GB GPU (L4, 4090, L40S).
 Uses paper's full hyperparameters: 128/256/64, 4 layers, 8 heads,
-seq_len=2048, 1000 epochs, N=2000.
+seq_len=2048, 1000 epochs, N=2000 (σ_min lowered to 1e-3, see PAPER_CONFIG).
 
 Multi-stock data: downloads S&P 500 constituents with >40 years history
-to match the paper's data collection methodology (Section 3.1.2).
+to match the paper's data collection methodology (Section 3.1.2). Whole
+tickers are held out for validation; evaluation samples n_seeds × n_generate
+paths and scores them with gbm_financial.compare (writes comparison.md).
 
 Usage:
     # Full paper reproduction (GBM + exponential, ~8 hours on L4):
@@ -33,10 +35,9 @@ import torch
 
 from gbm_financial.train import GBMFinancialDiffusion
 from gbm_financial.data import (get_dataloaders, download_stock_data,
-                               LONG_HISTORY_TICKERS, compute_sigma_max)
-from gbm_financial.metrics import (evaluate_stylized_facts, plot_stylized_facts,
-                                   plot_diagnostics, plot_pathwise_diagnostics,
-                                   plot_mean_path_diagnostic)
+                               load_raw_price_cache, LONG_HISTORY_TICKERS,
+                               compute_sigma_max)
+from gbm_financial.compare import (to_returns, run_comparison, format_report)
 
 
 # Paper's full configuration (Section 4)
@@ -44,9 +45,14 @@ PAPER_CONFIG = {
     # SDE
     "sde_type": "gbm",
     "schedule": "exponential",
-    "sigma_min": 0.01,
+    # Paper: σ_min=0.01. Lowered to 1e-3: on log-price paths 0.01 is the size
+    # of a daily return (std≈0.017), so the network never learned sub-daily
+    # structure and the samplers' last step decided the daily stylized facts.
+    "sigma_min": 1e-3,
     "sigma_max": "auto",   # Auto-computed from data (≈ 3× data range ≈ 8.35)
     "n_reverse_steps": 2000,
+    "vp_beta_min": 0.1,    # VP: β(t) = σ_VP(t)², σ_VP ∈ [√β_min, √β_max]
+    "vp_beta_max": 20.0,
 
     # Architecture (Section 3.1.1)
     "channels": 128,
@@ -73,10 +79,14 @@ PAPER_CONFIG = {
     "stride": 400,
     "min_years": 40,
     "use_synthetic": False,
+    "data_mode": "log_price",  # all SDEs (author's clarification)
+    "split": "ticker",         # hold out whole tickers → no window-overlap leakage
 
     # Generation / Sampling
     "n_generate": 120,
-    "sampling_eps": 4e-4,
+    "n_seeds": 3,              # independent sampling seeds for evaluation
+    "seed": 0,
+    "sampling_eps": 1e-5,      # samplers end with a Tweedie denoise, eps is no longer critical
     "pc_corrector_steps": 0,
 
     # No z-score normalization for GBM/log-price (paper faithful).
@@ -120,34 +130,25 @@ MINIMAL_CONFIG = {
 }
 
 
-def ensure_data(config, csv_path="data/sp500.csv"):
-    """Ensure financial data is available.
+def ensure_data(config, cache_dir="data/financial"):
+    """Make sure the raw multi-stock price cache exists (downloads if needed).
 
-    Priority:
-      1. Local CSV (data/sp500.csv) — single stock, limited windows
-      2. yfinance download — multiple stocks, paper's methodology
-
-    For paper reproduction, yfinance with multiple stocks is needed.
+    The cache (data/financial/sp500_prices_raw.pkl) stores unprocessed adjusted
+    closes; copy it to another machine to train on identical data.
     """
-    if os.path.exists(csv_path):
-        print(f"Found local CSV: {csv_path}")
-        # Check if we also have multi-stock cache
-        cache_file = "data/financial/sp500_prices.pkl"
-        if os.path.exists(cache_file):
-            print(f"Also found multi-stock cache: {cache_file}")
-        else:
-            print("TIP: For paper reproduction, install yfinance to download multiple stocks:")
-            print("     pip install yfinance")
-            print("     This gives 10-100x more training data.")
-    else:
-        print("No local CSV found. Attempting yfinance download...")
-        try:
-            import yfinance
-            download_stock_data(LONG_HISTORY_TICKERS, min_years=config.get("min_years", 40))
-        except ImportError:
-            print("ERROR: yfinance not installed. Install it or provide data/sp500.csv")
-            print("       pip install yfinance")
-            sys.exit(1)
+    if config.get("use_synthetic"):
+        return
+    if load_raw_price_cache(cache_dir) is not None:
+        return
+    print("No raw price cache found. Downloading with yfinance...")
+    try:
+        import yfinance  # noqa: F401
+    except ImportError:
+        print("ERROR: yfinance not installed (pip install yfinance), or copy "
+              f"{cache_dir}/sp500_prices_raw.pkl from another machine.")
+        sys.exit(1)
+    download_stock_data(LONG_HISTORY_TICKERS, min_years=config.get("min_years", 40),
+                        cache_dir=cache_dir)
 
 
 def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
@@ -165,6 +166,9 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
     print(f"  N_reverse={config['n_reverse_steps']}")
     print(f"{'=' * 70}")
 
+    torch.manual_seed(config.get("seed", 0))
+    np.random.seed(config.get("seed", 0))
+
     # Data
     train_loader, val_loader, data_info = get_dataloaders(
         sde_type=sde_type,
@@ -174,6 +178,9 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
         use_synthetic=config.get("use_synthetic", False),
         min_years=config.get("min_years", 40),
         num_workers=2,
+        data_mode=config.get("data_mode", "log_price"),
+        split=config.get("split", "ticker"),
+        seed=config.get("seed", 0),
     )
     n_batches = len(train_loader)
     total_steps = config["epochs"] * n_batches
@@ -189,7 +196,9 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
     # approximates the noised marginal at t=T.  With σ_max=1.0 on raw log-price
     # paths (range [-1, 3], std≈0.6), KL(marginal||prior)=0.16 → severe mismatch.
     # Auto-compute picks σ_max ≈ 3× data std (typically 5-10), giving KL < 0.01.
-    if config.get("sigma_max") == "auto":
+    if sde_type == "vp":
+        pass  # VP prior is N(0, 1); σ bounds come from vp_beta_min/max
+    elif config.get("sigma_max") == "auto":
         sigma_max, sigma_stats = compute_sigma_max(train_loader)
         config["sigma_max"] = sigma_max
         print(f"  σ_max auto-set to {sigma_max:.1f}")
@@ -221,58 +230,18 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
     else:
         print("WARNING: No best_model.pth found, evaluating final epoch model")
 
-    # Generate
-    n_gen = config.get("n_generate", 120)
-    sampler = config.get("sampler", "pc")
-    if sampler == "karras":
-        generated = model.generate_karras(n_samples=n_gen, seq_len=config["seq_len"])
-    elif sampler == "em":
-        generated = model.generate_em(n_samples=n_gen, seq_len=config["seq_len"])
-    elif sampler == "ode":
-        generated = model.generate_ode(n_samples=n_gen, seq_len=config["seq_len"])
-    else:
-        generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
-    np.save(os.path.join(exp_dir, "generated_data.npy"), generated)
-
-    # Get ALL real data for comparison (not just n_gen samples)
-    # Hill estimator is highly sample-size sensitive:
-    #   120 samples → α ≈ 6.5,  2551 samples → α ≈ 9.95
-    # Using a small subset artificially deflates α_real to match α_gen.
-    real_data = []
-    for batch in train_loader:
-        real_data.append(batch.numpy())
-    real_data = np.concatenate(real_data, axis=0)
-
-    # Evaluate
-    gen_results, real_results = model.evaluate(generated, real_data, save_dir=exp_dir)
-
-    # Full diagnostics plot
-    mode = "log_price" if sde_type == "gbm" else "log_return"
-    plot_diagnostics(generated, real_data, mode=mode,
-                     save_path=os.path.join(exp_dir, "diagnostics.png"))
-
-    # Pathwise diagnostics (Audit D expansion)
-    plot_pathwise_diagnostics(generated, real_data, mode=mode,
-                              save_path=os.path.join(exp_dir, "pathwise_diagnostics.png"))
-
-    # Cross-sectional mean path diagnostic (z-score diagnosis)
-    plot_mean_path_diagnostic(generated, real_data, mode=mode,
-                              save_path=os.path.join(exp_dir, "mean_path_diagnostic.png"))
-
-    # Save results
-    results = {
+    results = evaluate_model(model, config, train_loader, val_loader, exp_dir)
+    results.update({
         "sde_type": sde_type,
         "schedule": schedule,
-        "alpha_gen": gen_results["heavy_tail"]["alpha"],
-        "alpha_real": real_results["heavy_tail"]["alpha"] if real_results else None,
-        "beta_gen": gen_results["volatility_clustering"]["beta"],
-        "beta_real": real_results["volatility_clustering"]["beta"] if real_results else None,
         "n_train": data_info["n_train"],
+        "n_val": data_info["n_val"],
+        "val_tickers": data_info["val_tickers"],
+        "split": data_info["split"],
         "n_stocks": data_info["n_stocks"],
         "train_time_hours": train_time / 3600,
         "config": {k: v for k, v in config.items()
                    if isinstance(v, (int, float, str, bool))},
-        # Effective training parameters (includes derived/defaulted values)
         "training_params": {
             "data_mode": model.data_mode,
             "mask_anchor": model.mask_anchor,
@@ -286,12 +255,68 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
             "n_batches_per_epoch": n_batches,
             "device": str(model.device),
         },
-    }
+    })
 
     with open(os.path.join(exp_dir, "results.json"), "w") as f:
         json.dump(results, f, indent=2, default=str)
 
     return results
+
+
+def _sample(model, config, n, seed):
+    sampler = config.get("sampler", "pc")
+    fn = {"karras": model.generate_karras, "em": model.generate_em,
+          "ode": model.generate_ode}.get(sampler, model.generate)
+    return fn(n_samples=n, seq_len=config["seq_len"], seed=seed)
+
+
+def evaluate_model(model, config, train_loader, val_loader, exp_dir):
+    """Multi-seed generation + shared comparison harness + diagnostic plots.
+
+    Saves generated_seed{k}.npy, real_train.npy / real_val.npy (the reference
+    windows, reusable for cross-repo comparisons), comparison.{json,md}.
+    """
+    mode = model.data_mode
+    n_gen = config.get("n_generate", 120)
+    seeds = [config.get("seed", 0) + k for k in range(config.get("n_seeds", 3))]
+
+    real_train = np.concatenate([b.numpy() for b in train_loader.dataset.data.split(512)], 0)
+    real_val = np.concatenate([b.numpy() for b in val_loader.dataset.data.split(512)], 0)
+    np.save(os.path.join(exp_dir, "real_train.npy"), real_train)
+    np.save(os.path.join(exp_dir, "real_val.npy"), real_val)
+
+    gens = []
+    for sd in seeds:
+        g = _sample(model, config, n_gen, sd)
+        np.save(os.path.join(exp_dir, f"generated_seed{sd}.npy"), g)
+        gens.append(g)
+    np.save(os.path.join(exp_dir, "generated_data.npy"), gens[0])
+
+    real_r = to_returns(real_train, mode)
+    val_r = to_returns(real_val, mode)
+    label = f"ours: {config['sde_type']}+{config['schedule']}"
+    cmp = run_comparison(real_r, {label: [to_returns(g, mode) for g in gens]},
+                         holdout_r=val_r, baselines=True, n_baseline=n_gen)
+    table = format_report(cmp)
+    with open(os.path.join(exp_dir, "comparison.json"), "w") as f:
+        json.dump(cmp, f, indent=2)
+    with open(os.path.join(exp_dir, "comparison.md"), "w") as f:
+        f.write(table + "\n")
+    print("\n" + table)
+
+    # Stylized-fact, diagnostic, pathwise and mean-path plots (seed 0)
+    model.evaluate(gens[0], real_train, save_dir=exp_dir)
+
+    ours = cmp[label]
+    return {
+        "seeds": seeds,
+        "metrics": {k: v["mean"] for k, v in ours.items()},
+        "metrics_std": {k: v["std"] for k, v in ours.items()},
+        "alpha_gen": ours["alpha_top5"]["mean"],
+        "alpha_real": ours["alpha_top5_real"]["mean"],
+        "beta_gen": ours["vol_cluster_beta"]["mean"],
+        "beta_real": ours["vol_cluster_beta_real"]["mean"],
+    }
 
 
 def run_grid(base_config, save_dir):
@@ -372,6 +397,18 @@ def main():
                         help="Normalization mode: none, global, per_path")
     parser.add_argument("--sigma_max", type=str, default=None,
                         help="Override sigma_max (number or 'auto')")
+    parser.add_argument("--sigma_min", type=float, default=None,
+                        help="Override sigma_min (default 1e-3; paper used 0.01)")
+    parser.add_argument("--data_mode", type=str, default=None,
+                        choices=["log_price", "log_return"],
+                        help="Training representation (default log_price for all SDEs)")
+    parser.add_argument("--split", type=str, default=None, choices=["ticker", "random"],
+                        help="Train/val split (default: ticker hold-out)")
+    parser.add_argument("--seed", type=int, default=None, help="Base RNG seed")
+    parser.add_argument("--n_seeds", type=int, default=None,
+                        help="Number of sampling seeds for evaluation (default 3)")
+    parser.add_argument("--n_generate", type=int, default=None,
+                        help="Samples per seed (default 120, as in the paper)")
     parser.add_argument("--no-anchor", action="store_true",
                         help="Disable anchor masking (include pos 0 in loss)")
     parser.add_argument("--n-reverse", type=int, default=None,
@@ -445,6 +482,18 @@ def main():
         config["sampler"] = args.sampler
     if args.karras_rho is not None:
         config["karras_rho"] = args.karras_rho
+    if args.sigma_min is not None:
+        config["sigma_min"] = args.sigma_min
+    if args.data_mode:
+        config["data_mode"] = args.data_mode
+    if args.split:
+        config["split"] = args.split
+    if args.seed is not None:
+        config["seed"] = args.seed
+    if args.n_seeds is not None:
+        config["n_seeds"] = args.n_seeds
+    if args.n_generate is not None:
+        config["n_generate"] = args.n_generate
     if args.sigma_max:
         try:
             config["sigma_max"] = float(args.sigma_max)

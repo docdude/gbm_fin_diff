@@ -133,19 +133,28 @@ class SDE(abc.ABC):
 
 
 class VPSDE(SDE):
-  def __init__(self, beta_min=0.1, beta_max=20, N=1000):
-    """Construct a Variance Preserving SDE.
+  def __init__(self, beta_min=0.1, beta_max=20, N=1000, schedule="linear"):
+    """Construct a Variance Preserving SDE  dx = -½β(t)x dt + √β(t) dw.
+
+    Following the paper's author, the noise schedule defines σ(t) and the VP
+    parameterisation uses β(t) := σ(t)², with σ bounds √β_min and √β_max.
+    schedule='linear' reproduces the standard Song et al. VP SDE exactly
+    (β linear in t); 'exponential' and 'cosine' change the shape of σ(t).
 
     Args:
       beta_min: value of beta(0)
       beta_max: value of beta(1)
       N: number of discretization steps
+      schedule: 'linear', 'exponential', or 'cosine'
     """
     super().__init__(N)
     self.beta_0 = beta_min
     self.beta_1 = beta_max
+    self.schedule = schedule
+    self._s0 = math.sqrt(beta_min)
+    self._s1 = math.sqrt(beta_max)
     self.N = N
-    self.discrete_betas = torch.linspace(beta_min / N, beta_max / N, N)
+    self.discrete_betas = self._beta(torch.linspace(0., 1., N)) / N
     self.alphas = 1. - self.discrete_betas
     self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
     self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
@@ -155,17 +164,40 @@ class VPSDE(SDE):
   def T(self):
     return 1
 
+  def _beta(self, t):
+    return get_sigma(t, self.schedule, self._s0, self._s1) ** 2
+
+  def _int_beta(self, t):
+    """Closed-form ∫_0^t β(s) ds for each schedule."""
+    s0, s1 = self._s0, self._s1
+    if self.schedule == "linear":
+      return self.beta_0 * t + 0.5 * t ** 2 * (self.beta_1 - self.beta_0)
+    if self.schedule == "exponential":
+      log_r = math.log(s1 / s0)
+      return s0 ** 2 * (torch.exp(2 * log_r * t) - 1.0) / (2 * log_r)
+    if self.schedule == "cosine":
+      # σ(t) = c - (b/2) cos(πt) with b = s1 - s0, c = s0 + b/2
+      b = s1 - s0
+      c = s0 + b / 2
+      pt = math.pi * t
+      return (c ** 2 * t - c * b * torch.sin(pt) / math.pi
+              + (b ** 2 / 4) * (t / 2 + torch.sin(2 * pt) / (4 * math.pi)))
+    raise ValueError(f"Unknown schedule: {self.schedule}")
+
   def sde(self, x, t):
-    beta_t = self.beta_0 + t * (self.beta_1 - self.beta_0)
+    beta_t = self._beta(t)
     drift = -0.5 * _expand(beta_t, x) * x
     diffusion = torch.sqrt(beta_t)
     return drift, diffusion
 
   def marginal_prob(self, x, t):
-    log_mean_coeff = -0.25 * t ** 2 * (self.beta_1 - self.beta_0) - 0.5 * t * self.beta_0
+    log_mean_coeff = -0.5 * self._int_beta(t)
     mean = _expand(torch.exp(log_mean_coeff), x) * x
     std = torch.sqrt(1. - torch.exp(2. * log_mean_coeff))
     return mean, std
+
+  def mean_coeff(self, t):
+    return torch.exp(-0.5 * self._int_beta(t))
 
   def prior_sampling(self, shape):
     return torch.randn(*shape)
@@ -241,7 +273,9 @@ class VESDE(SDE):
     self.sigma_min = sigma_min
     self.sigma_max = sigma_max
     self.schedule = schedule
-    self.discrete_sigmas = torch.exp(torch.linspace(np.log(self.sigma_min), np.log(self.sigma_max), N))
+    # Discrete σ grid follows the configured schedule (was always geometric,
+    # which silently mismatched cosine/linear-trained networks).
+    self.discrete_sigmas = self._sigma(torch.linspace(0., 1., N))
     self.N = N
 
   @property
@@ -259,6 +293,19 @@ class VESDE(SDE):
       return torch.sqrt(sigma_sq)
     else:
       raise ValueError(f"Unknown schedule: {self.schedule}")
+
+  def t_from_sigma(self, sigma):
+    """Inverse of σ(t) for the configured schedule (σ clamped to [σ_min, σ_max])."""
+    smin, smax = self.sigma_min, self.sigma_max
+    sigma = torch.as_tensor(sigma, dtype=torch.float32).clamp(min=smin, max=smax)
+    if self.schedule == "exponential":
+      return torch.log(sigma / smin) / math.log(smax / smin)
+    elif self.schedule == "cosine":
+      u = (sigma - smin) / (smax - smin)
+      return torch.arccos((1.0 - 2.0 * u).clamp(-1.0, 1.0)) / math.pi
+    elif self.schedule == "linear":
+      return (sigma ** 2 - smin ** 2) / (smax ** 2 - smin ** 2)
+    raise ValueError(f"Unknown schedule: {self.schedule}")
 
   def _dsigma_sq_dt(self, t, sigma):
     """Compute d[σ²(t)]/dt for the diffusion coefficient g(t) = sqrt(d[σ²]/dt)."""
@@ -364,20 +411,21 @@ def get_sigma(t: torch.Tensor, schedule: str,
 
 def get_sde(sde_type: str, schedule: str = "exponential",
             sigma_min: float = 0.01, sigma_max: float = 1.0,
-            N: int = 2000) -> SDE:
+            N: int = 2000, beta_min: float = 0.1, beta_max: float = 20.0) -> SDE:
   """Create an SDE instance.
 
   Args:
       sde_type: 've', 'vp', 'subvp', or 'gbm'
-      schedule: 'linear', 'exponential', or 'cosine' (VE/GBM noise schedule)
-      sigma_min, sigma_max: noise bounds
+      schedule: 'linear', 'exponential', or 'cosine' (σ(t) shape; for VP, β=σ²)
+      sigma_min, sigma_max: VE/GBM noise bounds
+      beta_min, beta_max: VP bounds (σ_VP ∈ [√β_min, √β_max])
       N: number of discretization steps
   """
   sde_type = sde_type.lower()
   if sde_type == "ve":
     return VESDE(sigma_min, sigma_max, N, schedule=schedule)
   elif sde_type == "vp":
-    return VPSDE(beta_min=0.1, beta_max=20, N=N)
+    return VPSDE(beta_min=beta_min, beta_max=beta_max, N=N, schedule=schedule)
   elif sde_type == "subvp":
     return subVPSDE(beta_min=0.1, beta_max=20, N=N)
   elif sde_type == "gbm":

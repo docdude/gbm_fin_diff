@@ -5,8 +5,9 @@ Data construction per paper Section 3.1.2:
   1. S&P 500 constituents, stocks with >40 years of daily history
   2. Log-returns: r_t = log(p_t / p_{t-1})
   3. Sliding window: length 2048, stride 400
-  4. For GBM SDE: cumulative log-returns (= log-prices relative to first price)
-  5. For VE/VP SDE: raw log-returns
+  4. All SDEs train on anchored log-prices (log S_t - log S_0) — confirmed by
+     the paper's author; log-returns are only used for evaluation.
+  5. Optional legacy mode: raw log-returns (data_mode='log_return')
 
 Supports loading from:
   - Local CSV files (OHLCV format, e.g. data/sp500.csv)
@@ -113,120 +114,155 @@ def load_csv_data(csv_path="data/sp500.csv"):
     return stock_data
 
 
-def preprocess_prices(prices, ticker="", max_gap_days=5, outlier_sigma=5.0):
+def preprocess_prices(prices, ticker="", spike_threshold=0.4, reversal_tol=0.1,
+                      max_abs_log_return=None, outlier_sigma=None):
     """Preprocess a single stock's price series per paper Section 3.1.2.
 
     Steps:
       1. Drop NaN/zero/negative prices
-      2. Detect and remove trading gaps (suspensions >max_gap_days)
-      3. Remove outlier returns (|r| > outlier_sigma * σ) likely from data errors
-      4. Forward-fill small gaps (≤max_gap_days)
+      2. Repair one-day bad ticks: a move |r_t| > spike_threshold that is
+         reversed the next day (|r_t + r_{t+1}| < reversal_tol·|r_t|) — e.g.
+         BEN 1984-12-31 −91% then +92%. The net move is kept on day t+1.
+
+    Genuine crashes are KEPT (AIG 2008-09-15 −61%, AAPL 2000-09-29 −52%,
+    1987-10-19): the heavy tails are what the generator must learn. The old
+    default of zeroing every >5σ return truncated the tail and inflated the
+    real Hill α to ~9-10.
 
     Args:
         prices: 1D numpy array of adjusted close prices
         ticker: ticker name for logging
-        max_gap_days: maximum consecutive NaN days to forward-fill
-        outlier_sigma: clip returns beyond this many σ
+        spike_threshold: minimum |log-return| considered for bad-tick repair
+        reversal_tol: relative tolerance for "fully reversed next day"
+        max_abs_log_return: optional hard cap; moves beyond it are set to 0.
+            None (default) disables it.
+        outlier_sigma: legacy σ-based clipping; None (default) disables it.
+            Not recommended — it removes real tail events.
     Returns:
         cleaned 1D numpy array, or empty array if too short
     """
-    # Step 1: Remove NaN, zero, negative
     mask = np.isfinite(prices) & (prices > 0)
     prices = prices[mask]
     if len(prices) < 100:
         return np.array([])
 
-    # Step 2: Compute log-returns and detect outliers
     log_ret = np.diff(np.log(prices))
-    ret_std = np.std(log_ret)
-    ret_mean = np.mean(log_ret)
-
-    if ret_std < 1e-10:
+    if np.std(log_ret) < 1e-10:
         return np.array([])
 
-    # Flag outlier returns (>5σ from mean — likely data errors, splits, etc.)
-    outlier_mask = np.abs(log_ret - ret_mean) > outlier_sigma * ret_std
-    n_outliers = outlier_mask.sum()
+    n_fixed = 0
+    big = np.where(np.abs(log_ret[:-1]) > spike_threshold)[0]
+    for i in big:
+        if abs(log_ret[i] + log_ret[i + 1]) < reversal_tol * abs(log_ret[i]):
+            log_ret[i + 1] += log_ret[i]
+            log_ret[i] = 0.0
+            n_fixed += 1
 
-    if n_outliers > 0:
-        # Replace outlier returns with 0 (no price change) rather than removing
-        # to keep the time series contiguous
-        log_ret[outlier_mask] = 0.0
-        # Reconstruct prices from cleaned log-returns
-        log_prices = np.zeros(len(log_ret) + 1)
+    bad = np.zeros_like(log_ret, dtype=bool)
+    if max_abs_log_return is not None:
+        bad |= np.abs(log_ret) > max_abs_log_return
+    if outlier_sigma is not None:
+        bad |= np.abs(log_ret - log_ret.mean()) > outlier_sigma * log_ret.std()
+    log_ret[bad] = 0.0
+    n_fixed += int(bad.sum())
+
+    if n_fixed > 0:
+        log_prices = np.empty(len(log_ret) + 1)
         log_prices[0] = np.log(prices[0])
         log_prices[1:] = log_prices[0] + np.cumsum(log_ret)
         prices = np.exp(log_prices)
         if ticker:
-            print(f"    {ticker}: removed {n_outliers} outlier returns (>{outlier_sigma}σ)")
+            print(f"    {ticker}: repaired {n_fixed} bad tick(s)")
 
     return prices
+
+
+RAW_CACHE_NAME = "sp500_prices_raw.pkl"
+LEGACY_CACHE_NAME = "sp500_prices.pkl"  # pre-fix cache: >5σ returns zeroed — do not use
 
 
 def download_stock_data(tickers, min_years=40, cache_dir="data/financial"):
     """Download, preprocess, and cache historical stock data.
 
-    Preprocessing per paper Section 3.1.2:
-      - Drop NaN/zero/negative prices
-      - Remove outlier returns (>5σ, likely data errors or unhandled splits)
-      - Require minimum history length
+    The cache (``sp500_prices_raw.pkl``) stores UNPROCESSED adjusted closes as
+    ``{ticker: pd.Series(close, index=dates)}`` so preprocessing can change
+    without re-downloading and dates are available for time-based splits.
 
     Args:
         tickers: list of ticker symbols
         min_years: minimum years of history required
         cache_dir: directory to cache downloaded data
     Returns:
-        dict mapping ticker → numpy array of adjusted close prices
+        dict mapping ticker → numpy array of preprocessed adjusted close prices
     """
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_file = os.path.join(cache_dir, "sp500_prices.pkl")
+    raw = load_raw_price_cache(cache_dir)
+    if raw is None:
+        raw = _download_raw(tickers, min_years, cache_dir)
+    return preprocess_stock_data(raw)
 
-    if os.path.exists(cache_file):
-        print(f"Loading cached data from {cache_file}")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
 
+def load_raw_price_cache(cache_dir="data/financial"):
+    """Return the raw-price cache dict, or None if it does not exist."""
+    cache_file = os.path.join(cache_dir, RAW_CACHE_NAME)
+    if not os.path.exists(cache_file):
+        legacy = os.path.join(cache_dir, LEGACY_CACHE_NAME)
+        if os.path.exists(legacy):
+            print(f"NOTE: ignoring legacy cache {legacy} (tails were clipped at 5σ). "
+                  f"Re-downloading raw prices into {cache_file}.")
+        return None
+    print(f"Loading raw price cache: {cache_file}")
+    with open(cache_file, "rb") as f:
+        return pickle.load(f)
+
+
+def preprocess_stock_data(raw, min_len=2049):
+    """Apply preprocess_prices() to every ticker of a raw-price cache."""
+    stock_data = {}
+    for ticker, series in raw.items():
+        values = np.asarray(series, dtype=np.float64).ravel()
+        prices = preprocess_prices(values, ticker=ticker)
+        if len(prices) >= min_len:
+            stock_data[ticker] = prices
+    return stock_data
+
+
+def _download_raw(tickers, min_years, cache_dir):
     try:
         import yfinance as yf
     except ImportError:
         raise ImportError("yfinance is required: pip install yfinance")
 
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_file = os.path.join(cache_dir, RAW_CACHE_NAME)
     cutoff_date = datetime.now() - timedelta(days=min_years * 365)
-    # Filter out problematic tickers
     clean_tickers = [t for t in tickers if "." not in t and "-" not in t]
 
-    stock_data = {}
+    raw = {}
     print(f"Downloading data for {len(clean_tickers)} tickers...")
-
     for ticker in clean_tickers:
         try:
-            df = yf.download(ticker, start="1970-01-01", end=datetime.now().strftime("%Y-%m-%d"),
+            df = yf.download(ticker, start="1970-01-01",
+                             end=datetime.now().strftime("%Y-%m-%d"),
                              progress=False, auto_adjust=True)
             if df is None or len(df) == 0:
                 continue
-            # Check if history extends far enough
-            first_date = df.index[0].to_pydatetime()
-            if hasattr(first_date, 'tz') and first_date.tz:
-                first_date = first_date.replace(tzinfo=None)
-            if first_date <= cutoff_date:
-                raw_prices = df["Close"].values.astype(np.float64)
-                # Preprocess: drop NaN, remove outliers
-                prices = preprocess_prices(raw_prices, ticker=ticker)
-                if len(prices) > 2048:
-                    stock_data[ticker] = prices
-                    print(f"  {ticker}: {len(prices)} days from {df.index[0].date()}")
-                else:
-                    print(f"  {ticker}: too short after preprocessing ({len(prices)} days)")
+            close = df["Close"]
+            if isinstance(close, pd.DataFrame):
+                close = close.iloc[:, 0]
+            close = close.dropna()
+            first_date = close.index[0].to_pydatetime().replace(tzinfo=None)
+            if first_date <= cutoff_date and len(close) > 2048:
+                raw[ticker] = close.astype(np.float64)
+                print(f"  {ticker}: {len(close)} days from {close.index[0].date()}")
+            else:
+                print(f"  {ticker}: skipped (history from {first_date.date()})")
         except Exception as e:
             print(f"  {ticker}: failed ({e})")
-            continue
 
-    print(f"Downloaded {len(stock_data)} stocks with >{min_years} years of data")
-
+    print(f"Downloaded {len(raw)} stocks with >{min_years} years of data")
     with open(cache_file, "wb") as f:
-        pickle.dump(stock_data, f)
-
-    return stock_data
+        pickle.dump(raw, f)
+    return raw
 
 
 def create_subsequences(stock_data, window_len=2048, stride=400, mode="log_price"):
@@ -236,7 +272,7 @@ def create_subsequences(stock_data, window_len=2048, stride=400, mode="log_price
         stock_data: dict of ticker → price array
         window_len: subsequence length (default 2048)
         stride: sliding window stride (default 400)
-        mode: 'log_price' (for GBM SDE) or 'log_return' (for VE/VP SDE)
+        mode: 'log_price' (anchored at 0 per window) or 'log_return'
     Returns:
         numpy array of shape (N, window_len)
     """
@@ -318,75 +354,91 @@ class FinancialTimeSeriesDataset(Dataset):
         return self.data[idx]
 
 
+def ticker_split(tickers, train_ratio=0.9, seed=42):
+    """Deterministic ticker hold-out split → (train_tickers, val_tickers).
+
+    Shared by get_dataloaders() and the cross-repo comparison so every model
+    trains on exactly the same tickers.
+    """
+    tickers = sorted(tickers)
+    perm = np.random.RandomState(seed).permutation(len(tickers))
+    n_val = max(1, int(round(len(tickers) * (1 - train_ratio))))
+    val = sorted(tickers[i] for i in perm[:n_val])
+    train = sorted(t for t in tickers if t not in set(val))
+    return train, val
+
+
 def get_dataloaders(sde_type="gbm", window_len=2048, stride=400, batch_size=64,
                     use_synthetic=False, min_years=40, cache_dir="data/financial",
                     csv_path="data/sp500.csv",
-                    train_ratio=0.9, num_workers=0):
+                    train_ratio=0.9, num_workers=0, data_mode=None,
+                    split="ticker", seed=42):
     """Create train and validation dataloaders.
 
     Args:
-        sde_type: 'gbm' uses log-prices; 've' and 'vp' use log-returns
+        sde_type: SDE name (only used for logging; data_mode decides the data)
         window_len: sliding window length
         stride: sliding window stride
         batch_size: training batch size
         use_synthetic: if True, use synthetic GBM data (no download)
         min_years: minimum years of stock history
         cache_dir: data cache directory
-        csv_path: path to local OHLCV CSV (used first if it exists)
-        train_ratio: fraction of data for training
+        csv_path: single-ticker CSV fallback when no cache/download is possible
+        train_ratio: fraction of tickers (split='ticker') or windows
+            (split='random') used for training
         num_workers: dataloader workers
+        data_mode: 'log_price' (default for all SDEs — confirmed by the paper's
+            author) or 'log_return' (legacy VE/VP behaviour)
+        split: 'ticker' holds out whole tickers so overlapping windows cannot
+            leak between train and val; 'random' splits windows (legacy).
+            Falls back to 'random' when there is only one ticker.
+        seed: RNG seed for the split
     Returns:
         train_loader, val_loader, data_info dict
     """
-    # Get raw price data — priority: pkl cache > CSV > yfinance download > synthetic
-    cache_file = os.path.join(cache_dir, "sp500_prices.pkl")
+    # Priority: synthetic > raw cache > yfinance download > single-ticker CSV
     if use_synthetic:
         stock_data = generate_synthetic_gbm_data(n_sequences=100, seq_len=window_len + 500)
-    elif os.path.exists(cache_file):
-        # Prefer multi-stock pkl cache (105 stocks, ~5000 windows)
-        print(f"Loading multi-stock cache: {cache_file}")
-        with open(cache_file, "rb") as f:
-            stock_data = pickle.load(f)
-    elif os.path.exists(csv_path):
-        stock_data = load_csv_data(csv_path)
-        if len(stock_data) == 0:
-            print("CSV load failed, falling back to yfinance download")
-            stock_data = download_stock_data(LONG_HISTORY_TICKERS, min_years=min_years,
-                                             cache_dir=cache_dir)
     else:
-        stock_data = download_stock_data(LONG_HISTORY_TICKERS, min_years=min_years,
-                                         cache_dir=cache_dir)
+        raw = load_raw_price_cache(cache_dir)
+        if raw is not None:
+            stock_data = preprocess_stock_data(raw, min_len=window_len + 1)
+        else:
+            try:
+                stock_data = download_stock_data(LONG_HISTORY_TICKERS, min_years=min_years,
+                                                 cache_dir=cache_dir)
+            except ImportError:
+                print("yfinance unavailable, falling back to single-ticker CSV")
+                stock_data = load_csv_data(csv_path)
 
     if len(stock_data) == 0:
         print("No real data available, falling back to synthetic data")
         stock_data = generate_synthetic_gbm_data(n_sequences=100, seq_len=window_len + 500)
 
-    # Create subsequences
-    mode = "log_price" if sde_type == "gbm" else "log_return"
+    mode = data_mode or "log_price"
+    if mode not in ("log_price", "log_return"):
+        raise ValueError(f"Unknown data_mode: {mode}")
 
-    # Validate data/SDE mode consistency
-    if sde_type == "gbm" and mode != "log_price":
-        raise ValueError(
-            f"GBM SDE requires log-price data (cumulative log-returns), "
-            f"but mode={mode}. Set sde_type='gbm' to use log-prices."
-        )
-    if sde_type in ("ve", "vp") and mode == "log_price":
-        raise ValueError(
-            f"{sde_type.upper()} SDE expects log-return data, but mode={mode}. "
-            f"Log-price data with VE/VP SDE will produce incorrect results."
-        )
+    tickers = sorted(stock_data)
+    if split == "ticker" and len(tickers) >= 2:
+        val_tickers = set(ticker_split(tickers, train_ratio, seed)[1])
+        train_seqs = create_subsequences({t: stock_data[t] for t in tickers if t not in val_tickers},
+                                         window_len=window_len, stride=stride, mode=mode)
+        val_seqs = create_subsequences({t: stock_data[t] for t in tickers if t in val_tickers},
+                                       window_len=window_len, stride=stride, mode=mode)
+        split_used = "ticker"
+    else:
+        sequences = create_subsequences(stock_data, window_len=window_len, stride=stride, mode=mode)
+        perm = np.random.RandomState(seed).permutation(len(sequences))
+        n_train = int(len(sequences) * train_ratio)
+        train_seqs, val_seqs = sequences[perm[:n_train]], sequences[perm[n_train:]]
+        val_tickers = set()
+        split_used = "random"
 
-    sequences = create_subsequences(stock_data, window_len=window_len, stride=stride, mode=mode)
-
-    if len(sequences) == 0:
+    if len(train_seqs) == 0:
         raise RuntimeError("No subsequences created. Check data availability.")
-
-    # Train/val split
-    n_train = int(len(sequences) * train_ratio)
-    np.random.seed(42)
-    perm = np.random.permutation(len(sequences))
-    train_seqs = sequences[perm[:n_train]]
-    val_seqs = sequences[perm[n_train:]]
+    if len(val_seqs) == 0:
+        val_seqs = train_seqs[:1]
 
     train_dataset = FinancialTimeSeriesDataset(train_seqs)
     val_dataset = FinancialTimeSeriesDataset(val_seqs)
@@ -401,18 +453,22 @@ def get_dataloaders(sde_type="gbm", window_len=2048, stride=400, batch_size=64,
 
     if len(train_loader) == 0:
         raise RuntimeError(
-            f"Training loader is empty ({n_train} samples, batch_size={batch_size}). "
+            f"Training loader is empty ({len(train_seqs)} samples, batch_size={batch_size}). "
             f"Reduce stride or batch_size, or add more data."
         )
 
     data_info = {
-        "n_train": n_train,
-        "n_val": len(sequences) - n_train,
-        "n_total": len(sequences),
+        "n_train": len(train_seqs),
+        "n_val": len(val_seqs),
+        "n_total": len(train_seqs) + len(val_seqs),
         "seq_len": window_len,
         "mode": mode,
+        "split": split_used,
+        "val_tickers": sorted(val_tickers),
         "n_stocks": len(stock_data),
     }
+    print(f"Split={split_used}: {len(train_seqs)} train / {len(val_seqs)} val windows "
+          f"({len(stock_data)} stocks, {len(val_tickers)} held out)")
 
     return train_loader, val_loader, data_info
 

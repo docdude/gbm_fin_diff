@@ -14,7 +14,6 @@ import sys
 import os
 import json
 import numpy as np
-import pickle
 
 # Allow running from scripts/ subdirectory
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,17 +31,17 @@ from gbm_financial.metrics import (
     compute_drawdown_stats,
     compute_path_roughness,
 )
-from gbm_financial.data import create_subsequences
+from gbm_financial.data import (create_subsequences, load_raw_price_cache,
+                                preprocess_stock_data)
 
 
 def load_real_data(window_len=2048, stride=400):
-    """Load real data for comparison."""
-    cache_file = "data/financial/sp500_prices.pkl"
-    if not os.path.exists(cache_file):
-        print("No cached real data found at", cache_file)
+    """Load real data for comparison (raw price cache, real tails intact)."""
+    raw = load_raw_price_cache("data/financial")
+    if raw is None:
+        print("No raw price cache found at data/financial/sp500_prices_raw.pkl")
         return None
-    with open(cache_file, "rb") as f:
-        stock_data = pickle.load(f)
+    stock_data = preprocess_stock_data(raw, min_len=window_len + 1)
     seqs = create_subsequences(stock_data, window_len=window_len, stride=stride, mode="log_price")
     return seqs
 

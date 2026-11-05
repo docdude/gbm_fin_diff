@@ -448,6 +448,63 @@ def test_generation_scale(verbose=True):
     return passed
 
 
+class _GaussianOracle(torch.nn.Module):
+    """Exact ε-prediction for data x_0 ~ N(0, s² I) under the pipeline's SDE.
+
+    x_t ~ N(0, (m_t² s² + σ_t²) I) with m_t = mean coefficient (1 for VE),
+    so ε*(x_t, t) = σ_t x_t / (m_t² s² + σ_t²).
+    """
+
+    def __init__(self, sde, data_std):
+        super().__init__()
+        self.sde = sde
+        self.s2 = data_std ** 2
+
+    def forward(self, x, t):
+        m, std = self.sde.marginal_prob(torch.ones_like(x), t)
+        std = std.view(-1, *([1] * (x.dim() - 1)))
+        return std * x / (m ** 2 * self.s2 + std ** 2)
+
+
+def test_sampler_oracle(verbose=True, data_std=0.3, tol=0.10):
+    """Test 6: every sampler × SDE × schedule recovers the data scale with an
+    exact score. Catches schedule/σ-grid mismatches and wrong reverse drifts
+    (e.g. a PC predictor indexing a geometric σ table under a cosine schedule).
+    """
+    print("\n" + "=" * 60)
+    print("TEST 6: Sampler Oracle (all SDEs × schedules × samplers)")
+    print("=" * 60)
+
+    base = {
+        "channels": 8, "diff_emb_dim": 16, "feat_emb_dim": 4, "time_emb_dim": 8,
+        "n_layers": 1, "n_heads": 2, "sigma_min": 1e-3, "sigma_max": 5.0,
+        "n_reverse_steps": 400, "epochs": 1, "batch_size": 8, "lr": 1e-3,
+        "ema_decay": 0.0, "seq_len": 64, "sampling_eps": 1e-5,
+    }
+    combos = [("gbm", sch, smp) for sch in ("exponential", "cosine", "linear")
+              for smp in ("pc", "em", "ode", "karras")]
+    combos += [("vp", sch, smp) for sch in ("exponential", "cosine", "linear")
+               for smp in ("pc", "em", "ode")]
+
+    all_ok = True
+    for sde_type, schedule, sampler in combos:
+        cfg = dict(base, sde_type=sde_type, schedule=schedule,
+                   normalize_mode="none")
+        pipe = GBMFinancialDiffusion(cfg, device=torch.device("cpu"))
+        pipe.model = _GaussianOracle(pipe.sde, data_std)
+        fn = {"pc": pipe.generate, "em": pipe.generate_em,
+              "ode": pipe.generate_ode, "karras": pipe.generate_karras}[sampler]
+        out = fn(n_samples=64, seq_len=64, batch_size=64, seed=0)
+        ratio = out.std() / data_std
+        ok = np.isfinite(out).all() and abs(ratio - 1) < tol
+        all_ok &= bool(ok)
+        if verbose:
+            print(f"  {sde_type:<4} {schedule:<12} {sampler:<7} std ratio={ratio:.3f}  "
+                  f"{'PASS' if ok else 'FAIL'}")
+    print(f"  Result: {'PASS' if all_ok else 'FAIL'}")
+    return all_ok
+
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "#" * 60)
@@ -492,6 +549,13 @@ def run_all_tests():
     except Exception as e:
         results["gen_scale"] = ("ERROR", str(e))
 
+    # Test 6: Sampler oracle
+    try:
+        passed = test_sampler_oracle()
+        results["sampler_oracle"] = ("PASS" if passed else "FAIL", "")
+    except Exception as e:
+        results["sampler_oracle"] = ("ERROR", str(e))
+
     # Summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
@@ -516,7 +580,8 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=str, default="all",
-                        choices=["all", "oracle", "shapes", "train", "noise", "gen", "quick"])
+                        choices=["all", "oracle", "shapes", "train", "noise", "gen",
+                                 "samplers", "quick"])
     args = parser.parse_args()
 
     if args.test == "all":
@@ -531,6 +596,8 @@ if __name__ == "__main__":
         test_noise_prediction_quality()
     elif args.test == "gen":
         test_generation_scale()
+    elif args.test == "samplers":
+        test_sampler_oracle()
     elif args.test == "quick":
         # Quick: just oracle + shapes (fast, no training)
         test_sde_oracle()
