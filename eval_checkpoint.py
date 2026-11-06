@@ -167,7 +167,8 @@ def main():
     # Merge architecture keys from checkpoint config that may be missing
     # from results.json (e.g. wavenet_branch added after results.json was written)
     ckpt_config = ckpt.get("config", {})
-    for key in ("wavenet_branch", "wavenet_dilation_rates", "film_conditioning"):
+    for key in ("wavenet_branch", "wavenet_dilation_rates", "film_conditioning",
+                "precond", "edm_sigma_data", "edm_sigma_data_mode", "loss_weighting"):
         if key not in config and key in ckpt_config:
             config[key] = ckpt_config[key]
             print(f"  Merged '{key}={ckpt_config[key]}' from checkpoint config")

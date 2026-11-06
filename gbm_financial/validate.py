@@ -505,6 +505,69 @@ def test_sampler_oracle(verbose=True, data_std=0.3, tol=0.10):
     return all_ok
 
 
+def test_edm_precond(verbose=True, n_epochs=25):
+    """Test 7: EDM preconditioning — trains, samples and round-trips checkpoints
+    for scalar and per-position σ_data."""
+    import tempfile
+    from gbm_financial.data import generate_synthetic_gbm_data, create_subsequences
+    from torch.utils.data import DataLoader, TensorDataset
+
+    print("\n" + "=" * 60)
+    print("TEST 7: EDM Preconditioning")
+    print("=" * 60)
+    stock = generate_synthetic_gbm_data(n_sequences=30, seq_len=700)
+    seqs = create_subsequences(stock, window_len=64, stride=30, mode="log_price")
+    data = torch.from_numpy(seqs).float()
+    loader = DataLoader(TensorDataset(data), batch_size=16, shuffle=True, drop_last=True)
+    ok = True
+    for mode in ("scalar", "per_position"):
+        sd = data.std(dim=0).tolist() if mode == "per_position" else float(data.std())
+        cfg = {"channels": 32, "diff_emb_dim": 64, "feat_emb_dim": 16, "time_emb_dim": 32,
+               "n_layers": 2, "n_heads": 4, "sde_type": "gbm", "schedule": "exponential",
+               "sigma_min": 1e-3, "sigma_max": 5.0, "n_reverse_steps": 60, "epochs": n_epochs,
+               "batch_size": 16, "lr": 1e-3, "ema_decay": 0.0, "seq_len": 64,
+               "precond": "edm", "edm_sigma_data": sd, "edm_sigma_data_mode": mode}
+        torch.manual_seed(0)
+        pipe = GBMFinancialDiffusion(cfg)
+        losses = []
+        for _ in range(n_epochs):
+            tot = 0.0
+            for (b,) in loader:
+                pipe.optimizer.zero_grad()
+                loss = pipe.compute_loss(b.to(pipe.device))
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(pipe.model.parameters(), 1.0)
+                pipe.optimizer.step()
+                tot += loss.item()
+            losses.append(tot / len(loader))
+        finite = all(np.isfinite(losses))
+        decreased = losses[-1] < 0.9 * losses[0]  # EDM loss has a high irreducible floor
+        outs = {}
+        for name, fn in (("pc", pipe.generate), ("em", pipe.generate_em),
+                         ("ode", pipe.generate_ode), ("karras", pipe.generate_karras)):
+            g = fn(n_samples=8, seq_len=64, batch_size=8, seed=0)
+            outs[name] = bool(np.isfinite(g).all())
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "c.pth")
+            pipe.save(path, epoch=1)
+            cfg2 = dict(cfg)
+            cfg2.pop("edm_sigma_data")  # as when rebuilt from results.json
+            pipe2 = GBMFinancialDiffusion(cfg2)
+            pipe2.load(path)
+            x = torch.randn(4, 64, device=pipe.device)
+            t = torch.full((4,), 0.5, device=pipe.device)
+            pipe.model.eval(); pipe2.model.eval()
+            with torch.no_grad():
+                same = torch.allclose(pipe.model(x, t), pipe2.model(x, t), atol=1e-6)
+        passed = finite and decreased and all(outs.values()) and same
+        ok &= passed
+        if verbose:
+            print(f"  σ_data={mode:<12} loss {losses[0]:.3f}→{losses[-1]:.3f}  samplers finite={outs}  "
+                  f"checkpoint round-trip={same}  {'PASS' if passed else 'FAIL'}")
+    print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "#" * 60)
@@ -556,6 +619,13 @@ def run_all_tests():
     except Exception as e:
         results["sampler_oracle"] = ("ERROR", str(e))
 
+    # Test 7: EDM preconditioning
+    try:
+        passed = test_edm_precond()
+        results["edm_precond"] = ("PASS" if passed else "FAIL", "")
+    except Exception as e:
+        results["edm_precond"] = ("ERROR", str(e))
+
     # Summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
@@ -581,7 +651,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=str, default="all",
                         choices=["all", "oracle", "shapes", "train", "noise", "gen",
-                                 "samplers", "quick"])
+                                 "samplers", "edm", "quick"])
     args = parser.parse_args()
 
     if args.test == "all":
@@ -598,6 +668,8 @@ if __name__ == "__main__":
         test_generation_scale()
     elif args.test == "samplers":
         test_sampler_oracle()
+    elif args.test == "edm":
+        test_edm_precond()
     elif args.test == "quick":
         # Quick: just oracle + shapes (fast, no training)
         test_sde_oracle()

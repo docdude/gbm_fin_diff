@@ -72,7 +72,7 @@ PAPER_CONFIG = {
     "lr": 1e-3,
     "weight_decay": 1e-6,
     "ema_decay": 0.999,
-    "loss_weighting": "uniform",
+    # loss_weighting: unset → "uniform" (ε-prediction) or "edm" when precond="edm"
 
     # Data (Section 3.1.2)
     "window_len": 2048,
@@ -88,6 +88,11 @@ PAPER_CONFIG = {
     "seed": 0,
     "sampling_eps": 1e-5,      # samplers end with a Tweedie denoise, eps is no longer critical
     "sampler_noise_scale": 1.0,  # >1 counters score under-dispersion (PC/EM only)
+
+    # Network parameterisation: "none" (ε-prediction, as in the paper) or
+    # "edm" (Karras et al. 2022 preconditioning + loss weighting)
+    "precond": "none",
+    "edm_sigma_data_mode": "scalar",   # "scalar" or "per_position"
     "pc_corrector_steps": 0,
 
     # No z-score normalization for GBM/log-price (paper faithful).
@@ -206,6 +211,16 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None,
         print(f"  σ_max auto-set to {sigma_max:.1f}")
     elif isinstance(config.get("sigma_max"), str):
         raise ValueError(f"Unknown sigma_max value: {config['sigma_max']}")
+
+    if config.get("precond") == "edm" and config.get("edm_sigma_data") is None:
+        windows = train_loader.dataset.data
+        if config.get("edm_sigma_data_mode", "scalar") == "per_position":
+            config["edm_sigma_data"] = windows.std(dim=0).tolist()
+        else:
+            config["edm_sigma_data"] = float(windows.std())
+        sd = np.asarray(config["edm_sigma_data"])
+        print(f"  EDM σ_data ({config.get('edm_sigma_data_mode', 'scalar')}): "
+              f"{sd.min():.4f} … {sd.max():.4f}")
 
     # Model
     model = GBMFinancialDiffusion(config)
@@ -420,8 +435,13 @@ def main():
     parser.add_argument("--n-reverse", type=int, default=None,
                         help="Override number of reverse SDE steps for generation")
     parser.add_argument("--loss-weighting", type=str, default=None,
-                        choices=["uniform", "min_snr_5", "min_snr_3", "min_snr_1", "likelihood"],
+                        choices=["uniform", "min_snr_5", "min_snr_3", "min_snr_1", "likelihood", "edm"],
                         help="Loss weighting strategy (default: uniform)")
+    parser.add_argument("--precond", type=str, default=None, choices=["none", "edm"],
+                        help="Network parameterisation (default none = ε-prediction)")
+    parser.add_argument("--edm_sigma_data", type=str, default=None,
+                        choices=["scalar", "per_position"],
+                        help="EDM σ_data: global std or per-position std of training windows")
     parser.add_argument("--lr", type=float, default=None,
                         help="Initial learning rate (default 1e-3)")
     parser.add_argument("--warmstart_ema", action="store_true",
@@ -476,6 +496,10 @@ def main():
         config["n_reverse_steps"] = args.n_reverse
     if args.loss_weighting:
         config["loss_weighting"] = args.loss_weighting
+    if args.precond:
+        config["precond"] = args.precond
+    if args.edm_sigma_data:
+        config["edm_sigma_data_mode"] = args.edm_sigma_data
     if args.lr is not None:
         config["lr"] = args.lr
     if args.lr_schedule:

@@ -32,7 +32,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
 from .sde import get_sde, get_sigma, _expand, VPSDE
-from .score_network import FinancialScoreNetwork
+from .score_network import FinancialScoreNetwork, EDMPrecond
 from .metrics import (evaluate_stylized_facts, plot_stylized_facts,
                       plot_diagnostics, plot_pathwise_diagnostics,
                       plot_mean_path_diagnostic)
@@ -147,6 +147,18 @@ class GBMFinancialDiffusion:
 
         # Score network — subclasses CSDI_base, applies paper's modifications
         self.model = FinancialScoreNetwork(config, self.device)
+        self.precond = config.get("precond", "none")
+        if self.precond == "edm":
+            if isinstance(self.sde, VPSDE):
+                raise ValueError("EDM preconditioning is implemented for VE/GBM SDEs only")
+            sd = config.get("edm_sigma_data")
+            if sd is None:  # placeholder; the real value is restored from the checkpoint
+                sd = 0.5
+            self.model = EDMPrecond(self.model, self.sde._sigma, sd).to(self.device)
+            sd_t = self.model.sigma_data
+            print(f"  EDM preconditioning: σ_data "
+                  + (f"{sd_t.item():.4f}" if sd_t.dim() == 0 else
+                     f"per-position [{sd_t.min().item():.4f}, {sd_t.max().item():.4f}]"))
 
         n_params = sum(p.numel() for p in self.model.parameters())
         print(f"Score network: {n_params:,} parameters")
@@ -163,6 +175,8 @@ class GBMFinancialDiffusion:
 
         # Loss weighting strategy:
         #   "uniform"    — standard unweighted ε-prediction loss (default)
+        #   "edm"        — (σ²+σ_d²)/σ_d²: unit-weight loss on the EDM network
+        #                  output F (default when precond="edm")
         #   "min_snr_5"  — min(SNR, γ=5) weighting: upweights low-noise timesteps
         #                  where fine-grained structure (QV) is determined
         #   "min_snr_1"  — more aggressive variant with γ=1
@@ -171,7 +185,13 @@ class GBMFinancialDiffusion:
         if config.get("likelihood_weighting", False):
             self.loss_weighting = "likelihood"
         else:
-            self.loss_weighting = config.get("loss_weighting", "uniform")
+            default_w = "edm" if self.precond == "edm" else "uniform"
+            self.loss_weighting = config.get("loss_weighting") or default_w
+            if self.precond == "edm" and self.loss_weighting == "uniform":
+                print("  WARNING: precond='edm' with uniform ε-loss weighting — "
+                      "use loss_weighting='edm' unless intended")
+            if self.loss_weighting == "edm" and self.precond != "edm":
+                raise ValueError("loss_weighting='edm' requires precond='edm'")
         if self.loss_weighting != "uniform":
             print(f"  Loss weighting: {self.loss_weighting}")
 
@@ -259,7 +279,7 @@ class GBMFinancialDiffusion:
         if self.mask_anchor:
             print(f"  Anchor masking: ON (first timestep excluded from loss)")
 
-    def compute_loss(self, x_0, eps=1e-5):
+    def compute_loss(self, x_0, eps=1e-5, t=None, z=None):
         """Compute continuous-time denoising score matching loss.
 
         Following score_sde's get_sde_loss_fn:
@@ -285,11 +305,12 @@ class GBMFinancialDiffusion:
         """
         B = x_0.shape[0]
 
-        # Sample diffusion time uniformly
-        t = torch.rand(B, device=self.device) * (self.sde.T - eps) + eps  # U(eps, T)
-
-        # Sample noise
-        z = torch.randn_like(x_0)
+        # Sample diffusion time uniformly and noise (unless given, e.g. for
+        # deterministic validation)
+        if t is None:
+            t = torch.rand(B, device=self.device) * (self.sde.T - eps) + eps  # U(eps, T)
+        if z is None:
+            z = torch.randn_like(x_0)
 
         # Compute perturbed data: x_t = mean + std * z
         mean, std = self.sde.marginal_prob(x_0, t)
@@ -307,15 +328,13 @@ class GBMFinancialDiffusion:
         # For VP: same ε-prediction loss
         losses = (z - eps_pred) ** 2
 
-        # Mask anchor position: the first timestep is deterministic (always 0)
-        # when training on anchored log-price paths.  Zeroing its loss prevents
-        # the network from overfitting to the boundary condition.
-        if self.mask_anchor:
-            losses = losses.clone()
-            losses[:, 0] = 0.0
-
         # Apply loss weighting
-        if self.loss_weighting == "likelihood":
+        if self.loss_weighting == "edm":
+            sd = self.model.sigma_data_for(x_0.shape[-1])
+            sd2 = (sd ** 2).clamp(min=1e-12)
+            s2 = std.view(-1, 1) ** 2 if std.dim() == 1 else std ** 2
+            losses = losses * (s2 + sd2) / sd2
+        elif self.loss_weighting == "likelihood":
             _, diffusion = self.sde.sde(x_0, t)  # g(t)
             g2 = diffusion.pow(2)
             weights = g2 / std.pow(2).clamp(min=1e-12)  # g²/σ²
@@ -331,6 +350,13 @@ class GBMFinancialDiffusion:
             if weights.dim() == 1:
                 weights = weights.unsqueeze(-1)
             losses = losses * weights
+
+        # Mask anchor position: the first timestep is deterministic (always 0)
+        # when training on anchored log-price paths.  Zeroing its loss prevents
+        # the network from overfitting to the boundary condition. Applied after
+        # weighting (EDM per-position weights are infinite where σ_d = 0).
+        if self.mask_anchor:
+            losses = torch.cat([torch.zeros_like(losses[:, :1]), losses[:, 1:]], dim=1)
 
         loss = losses.mean()
 
@@ -612,17 +638,34 @@ class GBMFinancialDiffusion:
         print(f"\nTraining complete. Models saved to {save_dir}")
         print(f"TensorBoard logs: tensorboard --logdir {tb_dir}")
 
-    def _validate(self, val_loader):
+    def _validate(self, val_loader, n_repeats=4, eps=1e-5):
+        """Deterministic validation loss.
+
+        Uses stratified diffusion times and fixed noise (seeded per batch), so
+        consecutive evaluations differ only through the weights — random t/z
+        previously made val loss swing ±15% and best_model selection noisy.
+        """
         self.model.eval()
-        total_loss = 0
-        n_batches = 0
+        gen = torch.Generator(device=self.device)
+        total_loss, n = 0.0, 0
         with torch.no_grad():
-            for batch in val_loader:
+            for b, batch in enumerate(val_loader):
                 x_0 = batch.to(self.device)
-                loss = self.compute_loss(x_0)
-                total_loss += loss.item()
-                n_batches += 1
-        return total_loss / max(n_batches, 1)
+                if self.normalize_mode == "global":
+                    x_0 = (x_0 - self.data_mean) / self.data_std
+                elif self.normalize_mode == "per_path":
+                    mu = x_0.mean(dim=-1, keepdim=True)
+                    sd = x_0.std(dim=-1, keepdim=True).clamp(min=1e-8)
+                    x_0 = (x_0 - mu) / sd
+                B = x_0.shape[0]
+                for r in range(n_repeats):
+                    gen.manual_seed(1000 * b + r)
+                    u = (torch.arange(B, device=self.device) + (r + 0.5) / n_repeats) / B
+                    t = u * (self.sde.T - eps) + eps
+                    z = torch.randn(x_0.shape, generator=gen, device=self.device)
+                    total_loss += self.compute_loss(x_0, eps, t=t, z=z).item()
+                    n += 1
+        return total_loss / max(n, 1)
 
     # ------------------------------------------------------------------
     # Sampling helpers

@@ -460,3 +460,53 @@ class FinancialScoreNetwork(CSDI_base):
         We override to accept (x_t, t) directly for use with SDE training in train.py.
         """
         return self.score_forward(x_t, t)
+
+
+class EDMPrecond(nn.Module):
+    """EDM preconditioning (Karras et al. 2022) around an ε-network, VE/GBM only.
+
+    D(x; σ) = c_skip·x + c_out·F(c_in·x, t),  with
+        c_in = 1/√(σ²+σ_d²),  c_skip = σ_d²/(σ²+σ_d²),  c_out = σ·σ_d/√(σ²+σ_d²)
+
+    so the network sees unit-variance inputs and predicts x₀ at high noise
+    (instead of ε, whose errors are amplified by σ when recovering x₀) and ε at
+    low noise. forward() still returns ε̂ = (x − D)/σ, so every sampler and
+    the Tweedie denoise work unchanged.
+
+    σ_d may be a scalar or a per-position vector (L,): anchored log-price
+    paths have zero variance at day 0 growing to ~0.7 at day L.
+    """
+
+    def __init__(self, net, sigma_fn, sigma_data):
+        super().__init__()
+        self.net = net
+        self.sigma_fn = sigma_fn
+        self.register_buffer("sigma_data", torch.as_tensor(sigma_data, dtype=torch.float32))
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + "sigma_data"
+        if key in state_dict and state_dict[key].shape != self.sigma_data.shape:
+            self.sigma_data = state_dict[key].clone().to(self.sigma_data.device)
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
+    def sigma_data_for(self, L):
+        sd = self.sigma_data
+        if sd.dim() == 0:
+            return sd
+        if L <= sd.numel():
+            return sd[:L]
+        return torch.cat([sd, sd[-1].expand(L - sd.numel())])
+
+    def coefficients(self, sigma, L):
+        """Return (c_in, c_skip, c_out) broadcastable to (B, L)."""
+        s = sigma.view(-1, 1)
+        sd = self.sigma_data_for(L)
+        sd = sd.view(1, -1) if sd.dim() else sd
+        denom = s ** 2 + sd ** 2
+        return denom.rsqrt(), sd ** 2 / denom, s * sd * denom.rsqrt()
+
+    def forward(self, x_t, t):
+        sigma = self.sigma_fn(t)
+        c_in, c_skip, c_out = self.coefficients(sigma, x_t.shape[-1])
+        D = c_skip * x_t + c_out * self.net(c_in * x_t, t)
+        return (x_t - D) / sigma.view(-1, 1)
