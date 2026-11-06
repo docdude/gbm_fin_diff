@@ -998,7 +998,7 @@ class GBMFinancialDiffusion:
             print(f"  Per-path stats restored: {len(self.path_means)} windows")
         print(f"Loaded checkpoint from {path}")
 
-    def load_weights_only(self, path):
+    def load_weights_only(self, path, use_ema_weights=False):
         """Load model weights only — no optimizer, epoch, or scheduler state.
 
         Use for warm-starting a new architecture variant (e.g. adding WaveNet
@@ -1006,7 +1006,21 @@ class GBMFinancialDiffusion:
         fresh, epoch counter starts from 0.
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
-        result = self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+        state = dict(checkpoint["model_state_dict"])
+        if use_ema_weights:
+            ema_state = checkpoint.get("ema_state_dict")
+            if ema_state is None:
+                raise ValueError(f"{path} has no EMA weights")
+            shadow = ema_state.get("shadow", ema_state)
+            state.update(shadow)
+            print(f"  Warm-start from EMA weights ({len(shadow)} tensors)")
+        result = self.model.load_state_dict(state, strict=False)
+        if self.use_ema:
+            # EMA restarts from the loaded weights at full decay (no warm-up),
+            # so the averaged model stays anchored to the starting point.
+            self.ema.shadow = {n: p.data.clone() for n, p in self.model.named_parameters()
+                               if p.requires_grad}
+            self.ema.num_updates = 10 ** 6
         if result.missing_keys:
             print(f"  Warm-start: {len(result.missing_keys)} new keys "
                   f"(kept at init): {result.missing_keys[:5]}{'...' if len(result.missing_keys) > 5 else ''}")

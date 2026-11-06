@@ -152,7 +152,8 @@ def ensure_data(config, cache_dir="data/financial"):
                         cache_dir=cache_dir)
 
 
-def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
+def run_experiment(config, save_dir, resume_path=None, warmstart_path=None,
+                   warmstart_ema=False):
     """Run a single experiment with the given config."""
     sde_type = config["sde_type"]
     schedule = config["schedule"]
@@ -214,7 +215,7 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None):
         print(f"Resumed from {resume_path}")
 
     if warmstart_path:
-        model.load_weights_only(warmstart_path)
+        model.load_weights_only(warmstart_path, use_ema_weights=warmstart_ema)
         print(f"Warm-started model weights from {warmstart_path}")
 
     # Train
@@ -421,6 +422,10 @@ def main():
     parser.add_argument("--loss-weighting", type=str, default=None,
                         choices=["uniform", "min_snr_5", "min_snr_3", "min_snr_1", "likelihood"],
                         help="Loss weighting strategy (default: uniform)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Initial learning rate (default 1e-3)")
+    parser.add_argument("--warmstart_ema", action="store_true",
+                        help="With --warmstart: load the checkpoint's EMA weights")
     parser.add_argument("--lr-schedule", type=str, default=None,
                         choices=["multistep", "cosine"],
                         help="LR schedule: multistep (default) or cosine annealing")
@@ -471,6 +476,8 @@ def main():
         config["n_reverse_steps"] = args.n_reverse
     if args.loss_weighting:
         config["loss_weighting"] = args.loss_weighting
+    if args.lr is not None:
+        config["lr"] = args.lr
     if args.lr_schedule:
         config["lr_schedule"] = args.lr_schedule
     if args.lr_min is not None:
@@ -527,7 +534,7 @@ def main():
         run_grid(config, args.save_dir)
     else:
         run_experiment(config, args.save_dir, resume_path=args.resume,
-                       warmstart_path=args.warmstart)
+                       warmstart_path=args.warmstart, warmstart_ema=args.warmstart_ema)
 
 
 if __name__ == "__main__":
