@@ -434,6 +434,16 @@ class GBMFinancialDiffusion:
         self._best_epoch = start_epoch  # track which epoch produced best_model
         if start_epoch > 0:
             print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss}")
+            if not getattr(self, "_scheduler_restored", False):
+                # Older checkpoints have no scheduler state: fast-forward it so
+                # LR milestones stay at the intended absolute epochs.
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    for _ in range(start_epoch):
+                        self.scheduler.step()
+            print(f"  LR schedule at epoch {start_epoch}: "
+                  f"lr={self.optimizer.param_groups[0]['lr']:.2e}")
 
         # TensorBoard
         tb_dir = os.path.join(save_dir, "tb")
@@ -919,6 +929,7 @@ class GBMFinancialDiffusion:
             checkpoint["path_stds"] = self.path_stds
         if self.use_ema:
             checkpoint["ema_state_dict"] = self.ema.state_dict()
+        checkpoint["scheduler_state_dict"] = self.scheduler.state_dict()
         torch.save(checkpoint, path)
 
     def load(self, path):
@@ -945,6 +956,13 @@ class GBMFinancialDiffusion:
         if self.use_ema and "ema_state_dict" in checkpoint:
             self.ema.load_state_dict(checkpoint["ema_state_dict"])
             print(f"  EMA state restored")
+        self._scheduler_restored = False
+        if "scheduler_state_dict" in checkpoint:
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                self._scheduler_restored = True
+            except Exception:
+                pass
         # Restore epoch tracking
         self._resume_epoch = checkpoint.get("epoch", None)
         self._resume_best_val_loss = checkpoint.get("best_val_loss", None)
