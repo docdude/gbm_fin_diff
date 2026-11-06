@@ -650,6 +650,22 @@ class GBMFinancialDiffusion:
             x0 = x0 / _expand(self.sde.mean_coeff(t_batch), x0)
         return x0
 
+    def _noise_scale(self, sigma):
+        """Stochastic-sampler noise multiplier S_noise (EDM-style).
+
+        The learned score under-disperses (denoising shrinks return variance a
+        little at every noise level), so injecting slightly more noise than
+        the reverse SDE prescribes restores the scale. Applied only while
+        σ ∈ [sampler_noise_sigma_min, sampler_noise_sigma_max], to avoid
+        leaving white-noise jitter at the finest levels.
+        """
+        s = self.config.get("sampler_noise_scale", 1.0)
+        if s == 1.0:
+            return 1.0
+        lo = self.config.get("sampler_noise_sigma_min", 0.0)
+        hi = self.config.get("sampler_noise_sigma_max", float("inf"))
+        return s if lo <= float(sigma) <= hi else 1.0
+
     def _time_grid(self, N, eps):
         """Decreasing time grid T → eps with N points.
 
@@ -746,7 +762,7 @@ class GBMFinancialDiffusion:
                 g_sq = sigma ** 2 - sigmas_next[i] ** 2
                 x_mean = x + g_sq * score
                 if i < N - 1:
-                    x = x_mean + torch.sqrt(g_sq) * torch.randn_like(x)
+                    x = x_mean + self._noise_scale(sigma) * torch.sqrt(g_sq) * torch.randn_like(x)
                 else:
                     x = x_mean
 
@@ -780,7 +796,9 @@ class GBMFinancialDiffusion:
                 score = -eps_pred / std
                 drift, diffusion = self.sde.sde(x, t_batch)
                 g = _expand(diffusion, x)
-                x = x + (drift - g ** 2 * score) * dt + g * torch.sqrt(-dt) * torch.randn_like(x)
+                s_noise = self._noise_scale(std.flatten()[0]) if not self._is_vp else 1.0
+                x = (x + (drift - g ** 2 * score) * dt
+                     + s_noise * g * torch.sqrt(-dt) * torch.randn_like(x))
 
             x = self._denoise(x, torch.full((B,), eps, device=self.device))
             all_samples.append(x.cpu().numpy())

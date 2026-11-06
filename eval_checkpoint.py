@@ -123,6 +123,12 @@ def main():
                         help="Override data stride (default: from checkpoint config)")
     parser.add_argument("--no-plots", action="store_true",
                         help="Skip generating plot files")
+    parser.add_argument("--noise-scale", type=float, default=None,
+                        help="Stochastic-sampler noise multiplier S_noise (default 1.0)")
+    parser.add_argument("--noise-sigma-min", type=float, default=None,
+                        help="Apply --noise-scale only for σ ≥ this value")
+    parser.add_argument("--noise-sigma-max", type=float, default=None,
+                        help="Apply --noise-scale only for σ ≤ this value")
     parser.add_argument("--seed", type=int, default=0,
                         help="Sampling seed (logged for reproducibility)")
     args = parser.parse_args()
@@ -181,6 +187,11 @@ def main():
         config["sampling_eps"] = args.eps
     if args.karras_rho is not None:
         config["karras_rho"] = args.karras_rho
+    for arg, key in ((args.noise_scale, "sampler_noise_scale"),
+                     (args.noise_sigma_min, "sampler_noise_sigma_min"),
+                     (args.noise_sigma_max, "sampler_noise_sigma_max")):
+        if arg is not None:
+            config[key] = arg
 
     # Load data
     print("Loading data...")
@@ -307,6 +318,9 @@ def main():
         "checkpoint": args.checkpoint,
         "sampler": sampler_label,
         "eps": args.eps,
+        "sampler_noise_scale": config.get("sampler_noise_scale", 1.0),
+        "sampler_noise_sigma_range": [config.get("sampler_noise_sigma_min"),
+                                      config.get("sampler_noise_sigma_max")],
         "snr": args.snr,
         "corrector_steps": args.corrector_steps,
         "n_reverse": args.n_reverse,

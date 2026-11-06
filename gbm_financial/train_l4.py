@@ -87,6 +87,7 @@ PAPER_CONFIG = {
     "n_seeds": 3,              # independent sampling seeds for evaluation
     "seed": 0,
     "sampling_eps": 1e-5,      # samplers end with a Tweedie denoise, eps is no longer critical
+    "sampler_noise_scale": 1.0,  # >1 counters score under-dispersion (PC/EM only)
     "pc_corrector_steps": 0,
 
     # No z-score normalization for GBM/log-price (paper faithful).
@@ -405,6 +406,10 @@ def main():
     parser.add_argument("--split", type=str, default=None, choices=["ticker", "random"],
                         help="Train/val split (default: ticker hold-out)")
     parser.add_argument("--seed", type=int, default=None, help="Base RNG seed")
+    parser.add_argument("--noise_scale", type=float, default=None,
+                        help="Stochastic-sampler noise multiplier S_noise (PC/EM)")
+    parser.add_argument("--noise_sigma_range", type=float, nargs=2, default=None,
+                        metavar=("MIN", "MAX"), help="σ band where --noise_scale applies")
     parser.add_argument("--n_seeds", type=int, default=None,
                         help="Number of sampling seeds for evaluation (default 3)")
     parser.add_argument("--n_generate", type=int, default=None,
@@ -490,6 +495,10 @@ def main():
         config["split"] = args.split
     if args.seed is not None:
         config["seed"] = args.seed
+    if args.noise_scale is not None:
+        config["sampler_noise_scale"] = args.noise_scale
+    if args.noise_sigma_range is not None:
+        config["sampler_noise_sigma_min"], config["sampler_noise_sigma_max"] = args.noise_sigma_range
     if args.n_seeds is not None:
         config["n_seeds"] = args.n_seeds
     if args.n_generate is not None:
