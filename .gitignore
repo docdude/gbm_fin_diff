@@ -48,3 +48,6 @@ external/
 # Secrets (API keys)
 .env
 .env.*
+
+# Licensed market data pulls
+data/nas100/

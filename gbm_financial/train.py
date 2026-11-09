@@ -785,7 +785,7 @@ class GBMFinancialDiffusion:
         all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
 
             for i in tqdm(range(N), desc="PC sampling", leave=False, mininterval=2.0):
                 t_batch = torch.full((B,), timesteps[i].item(), device=self.device)
@@ -830,7 +830,7 @@ class GBMFinancialDiffusion:
         all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
 
             for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False, mininterval=2.0):
                 dt = timesteps[i + 1] - timesteps[i]  # negative
@@ -880,7 +880,7 @@ class GBMFinancialDiffusion:
         all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
 
             for i in tqdm(range(N - 1), desc="Karras/Heun", leave=False, mininterval=2.0):
                 h = sigmas[i + 1] - sigmas[i]
@@ -895,10 +895,18 @@ class GBMFinancialDiffusion:
 
         return self._finish_sampling(all_samples, n_samples, "Karras/Heun")
 
+    def _prior_shape(self, B, seq_len):
+        return (B, seq_len)
+
     @staticmethod
     def path_lag1_autocorr(paths, data_mode="log_price"):
-        """Per-path lag-1 autocorrelation of returns, shape (N,)."""
-        r = np.diff(paths, axis=1) if data_mode == "log_price" else np.asarray(paths)
+        """Per-path lag-1 autocorrelation of returns, shape (N,).
+
+        For (N, K, L) panels channel 0 (log-price) is used."""
+        paths = np.asarray(paths)
+        if paths.ndim == 3:
+            paths = paths[:, 0]
+        r = np.diff(paths, axis=1) if data_mode == "log_price" else paths
         rc = r - r.mean(axis=1, keepdims=True)
         var = (rc ** 2).mean(axis=1)
         return (rc[:, 1:] * rc[:, :-1]).mean(axis=1) / np.maximum(var, 1e-20)
@@ -959,7 +967,7 @@ class GBMFinancialDiffusion:
                     if k != "schedule" else a == b)
             if not same:
                 raise ValueError(f"Splice model {k}={a} differs from this model's {b}")
-        fine = GBMFinancialDiffusion(cfg, device=self.device)
+        fine = type(self)(cfg, device=self.device)
         fine.load(path)
         if fine.use_ema:
             fine.ema.apply_shadow()
@@ -1017,7 +1025,7 @@ class GBMFinancialDiffusion:
         all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
 
             for i in tqdm(range(n_ode - 1), desc="Hybrid/Heun", leave=False, mininterval=2.0):
                 h = sig_ode[i + 1] - sig_ode[i]
@@ -1056,7 +1064,7 @@ class GBMFinancialDiffusion:
         all_samples, n_remaining = [], n_samples
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
-            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+            x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
 
             for i in tqdm(range(N - 1), desc="PF-ODE", leave=False, mininterval=2.0):
                 dt = timesteps[i + 1] - timesteps[i]

@@ -355,7 +355,7 @@ class FinancialScoreNetwork(CSDI_base):
             "model": {
                 "timeemb": config.get("time_emb_dim", 128),
                 "featureemb": config.get("feat_emb_dim", 64),
-                "is_unconditional": 1,        # unconditional generation
+                "is_unconditional": 0 if config.get("conditional") else 1,
                 "target_strategy": "random",   # unused but required by CSDI_base
             },
             "diffusion": {
@@ -378,7 +378,14 @@ class FinancialScoreNetwork(CSDI_base):
         #   self.diffmodel    = diff_CSDI(config_diff, inputdim=1)
         #   self.emb_time_dim, self.emb_feature_dim, self.emb_total_dim
         #   self.alpha_torch  (DDPM schedule — unused with SDE training)
-        super().__init__(target_dim=1, config=csdi_config, device=device)
+        # target_dim = number of channels K (1 = univariate paper setup).
+        # conditional=True: some channels are observed (cond_mask=1) and fed
+        # to the network as clean values; the rest are denoised.
+        super().__init__(target_dim=int(config.get("n_channels", 1)), config=csdi_config,
+                         device=device)
+        self.conditional = bool(config.get("conditional", False))
+        self._cond = None
+        self._cond_mask = None
 
         # --- Paper modification #1: continuous diffusion embedding ---
         # Replace diff_CSDI's discrete DiffusionEmbedding (lookup table)
@@ -423,6 +430,15 @@ class FinancialScoreNetwork(CSDI_base):
         # Move everything to the target device
         self.to(device)
 
+    def set_condition(self, cond, cond_mask):
+        """Set conditioning for subsequent forward() calls.
+
+        cond: (B, K, L) clean values (only cond channels are read);
+        cond_mask: (K,) or (B, K, L) with 1 for observed channels.
+        """
+        self._cond = cond
+        self._cond_mask = cond_mask
+
     def score_forward(self, x_t, t):
         """Forward pass for continuous-time SDE score estimation.
 
@@ -436,6 +452,8 @@ class FinancialScoreNetwork(CSDI_base):
         Returns:
             epsilon_pred: (B, L) predicted noise
         """
+        if x_t.dim() == 3:
+            return self._score_forward_multi(x_t, t)
         B, L = x_t.shape
 
         # Reshape to CSDI 4D format: (B, inputdim=1, K=1, L)
@@ -452,6 +470,26 @@ class FinancialScoreNetwork(CSDI_base):
         predicted = self.diffmodel(x, side_info, t)  # (B, K=1, L)
 
         return predicted.squeeze(1)  # (B, L)
+
+    def _score_forward_multi(self, x_t, t):
+        """(B, K, L) input → (B, K, L) ε prediction (zero on observed channels)."""
+        B, K, L = x_t.shape
+        observed_tp = torch.arange(L, device=x_t.device).float().unsqueeze(0).expand(B, -1)
+        if self.conditional:
+            if self._cond is None:
+                raise RuntimeError("Conditional network: call set_condition() first")
+            cm = self._cond_mask.to(x_t.device).float()
+            if cm.dim() == 1:
+                cm = cm.view(1, K, 1).expand(B, K, L)
+            cond = self._cond.to(x_t.device)
+            if cond.shape[0] != B:
+                cond = cond.expand(B, -1, -1)
+            side_info = self.get_side_info(observed_tp, cm)
+            x = torch.stack([cm * cond, (1 - cm) * x_t], dim=1)          # (B, 2, K, L)
+            return self.diffmodel(x, side_info, t) * (1 - cm)
+        cm = torch.ones(B, K, L, device=x_t.device)
+        side_info = self.get_side_info(observed_tp, cm)
+        return self.diffmodel(x_t.unsqueeze(1), side_info, t)            # (B, K, L)
 
     def forward(self, x_t, t):
         """Override CSDI_base.forward for continuous-time SDE interface.
@@ -489,6 +527,9 @@ class EDMPrecond(nn.Module):
             self.sigma_data = state_dict[key].clone().to(self.sigma_data.device)
         super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
+    def set_condition(self, cond, cond_mask):
+        self.net.set_condition(cond, cond_mask)
+
     def sigma_data_for(self, L):
         sd = self.sigma_data
         if sd.dim() == 0:
@@ -497,8 +538,16 @@ class EDMPrecond(nn.Module):
             return sd[:L]
         return torch.cat([sd, sd[-1].expand(L - sd.numel())])
 
-    def coefficients(self, sigma, L):
-        """Return (c_in, c_skip, c_out) broadcastable to (B, L)."""
+    def coefficients(self, sigma, L, n_channels=None):
+        """Return (c_in, c_skip, c_out) broadcastable to (B, L) or (B, K, L).
+
+        For multichannel input σ_data may be per channel (K,)."""
+        if n_channels is not None:
+            s = sigma.view(-1, 1, 1)
+            sd = self.sigma_data
+            sd = sd.view(1, -1, 1) if sd.dim() and sd.numel() == n_channels else sd
+            denom = s ** 2 + sd ** 2
+            return denom.rsqrt(), sd ** 2 / denom, s * sd * denom.rsqrt()
         s = sigma.view(-1, 1)
         sd = self.sigma_data_for(L)
         sd = sd.view(1, -1) if sd.dim() else sd
@@ -507,6 +556,7 @@ class EDMPrecond(nn.Module):
 
     def forward(self, x_t, t):
         sigma = self.sigma_fn(t)
-        c_in, c_skip, c_out = self.coefficients(sigma, x_t.shape[-1])
+        K = x_t.shape[1] if x_t.dim() == 3 else None
+        c_in, c_skip, c_out = self.coefficients(sigma, x_t.shape[-1], K)
         D = c_skip * x_t + c_out * self.net(c_in * x_t, t)
-        return (x_t - D) / sigma.view(-1, 1)
+        return (x_t - D) / sigma.view(-1, *([1] * (x_t.dim() - 1)))

@@ -570,6 +570,64 @@ def test_edm_precond(verbose=True, n_epochs=25):
     return ok
 
 
+def test_panel_model(verbose=True, n_epochs=3):
+    """Test 8: multichannel conditional panel model (ε and EDM) — training,
+    conditioning preserved in samples, hybrid sampler, checkpoint round trip."""
+    import tempfile
+    from torch.utils.data import DataLoader
+    from gbm_financial.data import FinancialTimeSeriesDataset
+    from gbm_financial.panel_model import PanelDiffusion
+
+    print("\n" + "=" * 60)
+    print("TEST 8: Multichannel Conditional Panel Model")
+    print("=" * 60)
+    rng = np.random.default_rng(0)
+    N, L = 96, 64
+    m = rng.standard_normal((N, L)) * 0.017
+    tk = 0.8 * m + 0.6 * rng.standard_normal((N, L)) * 0.017
+    X = np.stack([np.cumsum(tk, 1) - tk[:, :1], np.abs(tk) * 2, rng.standard_normal((N, L)) * 0.02,
+                  np.cumsum(m, 1) - m[:, :1], rng.standard_normal((N, L)) * 0.05], 1).astype(np.float32)
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        for precond in ("none", "edm"):
+            cfg = {"channels": 16, "diff_emb_dim": 32, "feat_emb_dim": 8, "time_emb_dim": 16,
+                   "n_layers": 1, "n_heads": 2, "sde_type": "gbm", "schedule": "exponential",
+                   "sigma_min": 1e-3, "sigma_max": 5.0, "n_reverse_steps": 40, "epochs": n_epochs,
+                   "batch_size": 16, "lr": 1e-3, "ema_decay": 0.0, "seq_len": L, "precond": precond,
+                   "n_channels": 5, "conditional": True, "cond_channels": [3, 4], "anchor_channels": [0, 3],
+                   "checkpoint_every": 1000, "hybrid_ode_steps": 10, "hybrid_sde_steps": 40}
+            if precond == "edm":
+                cfg["edm_sigma_data"] = [float(X[:, k].std()) for k in range(5)]
+            torch.manual_seed(0)
+            pipe = PanelDiffusion(cfg)
+            loader = DataLoader(FinancialTimeSeriesDataset(X), batch_size=16, shuffle=True, drop_last=True)
+            sub = os.path.join(d, precond)
+            pipe.train(loader, loader, save_dir=sub)
+            res = {}
+            for smp in ("pc", "hybrid"):
+                pipe.config["sampler"] = smp
+                G = pipe.sample_panel(8, L, cond=X[:8], seed=0)
+                res[smp] = (G.shape == (8, 5, L) and np.isfinite(G).all()
+                            and np.allclose(G[:, 3:], X[:8, 3:]))
+            pipe2 = PanelDiffusion(dict(cfg, edm_sigma_data=None) if precond == "edm" else cfg)
+            pipe2.load(os.path.join(sub, "final_model.pth"))
+            x = torch.randn(4, 5, L, device=pipe.device)
+            t = torch.full((4,), 0.3, device=pipe.device)
+            c = torch.as_tensor(X[:4], device=pipe.device)
+            pipe._set_cond(c); pipe2._set_cond(c)
+            pipe.model.eval(); pipe2.model.eval()
+            with torch.no_grad():
+                same = torch.allclose(pipe.model(x, t), pipe2.model(x, t), atol=1e-5)
+                cond_zero = bool((pipe.model(x, t)[:, 3:].abs() < 1e-6).all()) if precond == "none" else True
+            passed = all(res.values()) and same and cond_zero
+            ok &= passed
+            if verbose:
+                print(f"  precond={precond:<5} samplers(shape, finite, cond kept)={res}  "
+                      f"round-trip={same}  cond-channel ε=0: {cond_zero}  {'PASS' if passed else 'FAIL'}")
+    print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "#" * 60)
@@ -628,6 +686,13 @@ def run_all_tests():
     except Exception as e:
         results["edm_precond"] = ("ERROR", str(e))
 
+    # Test 8: panel model
+    try:
+        passed = test_panel_model()
+        results["panel_model"] = ("PASS" if passed else "FAIL", "")
+    except Exception as e:
+        results["panel_model"] = ("ERROR", str(e))
+
     # Summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
@@ -653,7 +718,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=str, default="all",
                         choices=["all", "oracle", "shapes", "train", "noise", "gen",
-                                 "samplers", "edm", "quick"])
+                                 "samplers", "edm", "panel", "quick"])
     args = parser.parse_args()
 
     if args.test == "all":
@@ -672,6 +737,8 @@ if __name__ == "__main__":
         test_sampler_oracle()
     elif args.test == "edm":
         test_edm_precond()
+    elif args.test == "panel":
+        test_panel_model()
     elif args.test == "quick":
         # Quick: just oracle + shapes (fast, no training)
         test_sde_oracle()
