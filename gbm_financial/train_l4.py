@@ -366,6 +366,7 @@ def run_eval_only(cli_config, save_dir, tag=None):
     with open(os.path.join(exp_dir, "results.json")) as f:
         config = json.load(f)["config"]
     for k in ("sampler", "hybrid_sigma_switch", "hybrid_ode_steps", "hybrid_sde_steps",
+              "hybrid_fine_checkpoint", "hybrid_fine_sigma",
               "karras_rho", "n_reverse_steps", "sampling_eps", "pc_corrector_steps",
               "sampler_noise_scale", "sampler_noise_sigma_min", "sampler_noise_sigma_max",
               "reject_failed", "reject_ac1_below", "n_generate", "n_seeds", "seed"):
@@ -373,7 +374,8 @@ def run_eval_only(cli_config, save_dir, tag=None):
             config[k] = cli_config[k]
     tag = tag or f"{config.get('sampler', 'pc')}" + (
         f"_{config['hybrid_sigma_switch']:g}" if config.get("sampler") == "hybrid" else "") + (
-        "_filter" if config.get("reject_failed") else "")
+        "_filter" if config.get("reject_failed") else "") + (
+        f"_splice{config.get('hybrid_fine_sigma', 0):g}" if config.get("hybrid_fine_checkpoint") else "")
     out_dir = os.path.join(exp_dir, f"eval_{tag}")
 
     train_loader, val_loader, _ = get_dataloaders(
@@ -523,6 +525,10 @@ def main():
                         help="Sampling method for generation (default: pc)")
     parser.add_argument("--hybrid_sigma_switch", type=float, default=None,
                         help="Hybrid sampler: σ below which the stochastic SDE takes over")
+    parser.add_argument("--hybrid_fine_checkpoint", type=str, default=None,
+                        help="Hybrid sampler: splice in this checkpoint's network for σ < "
+                             "--hybrid_fine_sigma (same noise schedule required)")
+    parser.add_argument("--hybrid_fine_sigma", type=float, default=None)
     parser.add_argument("--reject_failed", action="store_true",
                         help="Reject failed samples (lag-1 return ACF below the real "
                              "0.1th percentile) and resample")
@@ -591,6 +597,10 @@ def main():
         config["hybrid_sigma_switch"] = args.hybrid_sigma_switch
     if args.reject_failed:
         config["reject_failed"] = True
+    if args.hybrid_fine_checkpoint:
+        config["hybrid_fine_checkpoint"] = args.hybrid_fine_checkpoint
+    if args.hybrid_fine_sigma is not None:
+        config["hybrid_fine_sigma"] = args.hybrid_fine_sigma
     if args.sigma_min is not None:
         config["sigma_min"] = args.sigma_min
     if args.data_mode:

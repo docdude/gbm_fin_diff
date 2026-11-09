@@ -944,6 +944,30 @@ class GBMFinancialDiffusion:
               f"({100 * self.last_rejection_rate:.1f}%, ac1 < {thr:.3f})")
         return out[:n_samples]
 
+    def _fine_net(self):
+        """Load (once) the splice model named by config['hybrid_fine_checkpoint']."""
+        path = self.config.get("hybrid_fine_checkpoint")
+        if not path:
+            return None
+        if getattr(self, "_fine_path", None) == path:
+            return self._fine
+        ck = torch.load(path, map_location=self.device, weights_only=False)
+        cfg = dict(ck["config"])
+        for k in ("schedule", "sigma_min", "sigma_max"):
+            a, b = cfg.get(k), self.config.get(k)
+            same = (abs(float(a) - float(b)) < 1e-6 * max(1.0, abs(float(b)))
+                    if k != "schedule" else a == b)
+            if not same:
+                raise ValueError(f"Splice model {k}={a} differs from this model's {b}")
+        fine = GBMFinancialDiffusion(cfg, device=self.device)
+        fine.load(path)
+        if fine.use_ema:
+            fine.ema.apply_shadow()
+        fine.model.eval()
+        self._fine, self._fine_path = fine.model, path
+        print(f"  Splice: σ < {self.config.get('hybrid_fine_sigma', 0.0):g} uses {path}")
+        return self._fine
+
     @torch.no_grad()
     def generate_hybrid(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
         """Deterministic Heun above σ_switch, stochastic reverse SDE below it.
@@ -957,6 +981,10 @@ class GBMFinancialDiffusion:
 
         Config: hybrid_sigma_switch (0.1), hybrid_ode_steps (100),
         hybrid_sde_steps (1000), karras_rho (7).
+
+        Model splice: if hybrid_fine_checkpoint is set, the network from that
+        checkpoint (EMA weights) replaces this one for σ < hybrid_fine_sigma
+        in the stochastic phase. Both models must share the noise schedule.
         """
         if self._is_vp:
             raise ValueError("Hybrid sampler is only implemented for VE/GBM SDEs")
@@ -980,6 +1008,8 @@ class GBMFinancialDiffusion:
         sig_sde = torch.exp(torch.linspace(math.log(sw), math.log(s_end), n_sde)).to(self.device)
         t_sde = self.sde.t_from_sigma(sig_sde).to(self.device)
         sig_sde_next = torch.cat([sig_sde[1:], torch.zeros(1, device=self.device)])
+        fine_net = self._fine_net()
+        fine_sigma = float(self.config.get("hybrid_fine_sigma", 0.0)) if fine_net is not None else 0.0
 
         print(f"\nGenerating {n_samples} samples (hybrid: Heun {n_ode} steps σ {smax:.3g}→{sw:.3g}, "
               f"reverse SDE {n_sde} steps σ {sw:.3g}→0)...")
@@ -998,7 +1028,8 @@ class GBMFinancialDiffusion:
 
             for i in tqdm(range(n_sde), desc="Hybrid/SDE", leave=False, mininterval=2.0):
                 sigma = sig_sde[i]
-                eps_pred = self.model(x, torch.full((B,), t_sde[i].item(), device=self.device))
+                net = fine_net if sigma < fine_sigma else self.model
+                eps_pred = net(x, torch.full((B,), t_sde[i].item(), device=self.device))
                 g_sq = sigma ** 2 - sig_sde_next[i] ** 2
                 x = x - g_sq / sigma * eps_pred
                 if i < n_sde - 1:
