@@ -108,6 +108,46 @@ floor (a classifier also separates *different real tickers* at this window lengt
 generated paths are rejected by the filter. Known residual gaps: return scale ×0.9, terminal
 spread ×1.3, mean 2048-day drift 0.70 vs 0.95, clustering decay β slightly fast.
 
+### Multi-asset synthetic OHLCV panels (NAS-100 → FinRL-Meta MACE/margin env)
+
+Two models generate whole cross-sectional panels:
+
+- **Market model** (unconditional, K=2): equal-weight market log-price + log VIX.
+- **Ticker model** (K=5, last two channels observed): per-ticker anchored log-price,
+  log(high/low) range and log volume relative to its trailing 252-day median,
+  **conditioned on the market path**. Every ticker in a scenario shares one market path,
+  which is what produces realistic cross-asset correlation.
+
+All channels are scaled per ticker so day-to-day changes have std 0.017. Training data
+is Tiingo 1995 → 2024-05-31, which ends on the env's last training day, so no trade-period leakage.
+
+```bash
+# 1. data (FinRL-Meta venv, uses its Tiingo processor + repo .env)
+~/FinRL-Meta/.venv/bin/python scripts/fetch_nas100_history.py
+# 2. models (EDM + ε for each, then spliced at sampling time)
+python -m gbm_financial.train_panel --model ticker --precond edm --save_dir save/panel/ticker_edm
+python -m gbm_financial.train_panel --model ticker --save_dir save/panel/ticker_eps
+python -m gbm_financial.train_panel --model market --precond edm --save_dir save/panel/market_edm
+python -m gbm_financial.train_panel --model market --save_dir save/panel/market_eps
+# 3. scenarios: 512-day panels for all 99 tickers on real trading calendars
+python -m gbm_financial.panel_assembly --n_scenarios 50 --out save/panel/scenarios \
+    --ticker_dir save/panel/ticker_edm --ticker_fine save/panel/ticker_eps/best_model.pth \
+    --market_dir save/panel/market_edm --market_fine save/panel/market_eps/best_model.pth
+python -m gbm_financial.panel_eval --scenarios save/panel/scenarios      # vs real panels
+# 4. env configs via the env's own indicator/volatility/ADV/T-bill pipeline (FinRL-Meta venv)
+~/FinRL-Meta/.venv/bin/python scripts/export_finrl_meta_env.py --scenarios save/panel/scenarios
+```
+
+Each `scenario_XXX.env.pkl` has the same structure as `MarketDataPreparator.create_env_config()`
+(`price_array`, `tech_array`, `volatility_array`, `volume_array`, `adv20_array`, `tbill_rates`, …),
+so it can stand in for the real train config. `--check_equivalence` rebuilds the real
+train config through this exporter and matches the env's own output exactly
+(indicators within 0.4%, from EMA warm-up). Use `--market real` to condition on real
+market+VIX windows instead of the market model.
+
+Data note: in the env's cached Tiingo data, `FB` is a constant 39.39 for 2010–2025
+(the ticker was renamed META). The fetch script pulls `META` history under `FB`.
+
 ### Train on S&P 500 data
 
 ```bash
@@ -137,6 +177,11 @@ gbm_fin_diff/
 │   ├── __init__.py
 │   ├── config.yaml          # Default hyperparameters (paper Section 4)
 │   ├── compare.py           # Shared comparison harness + baselines
+│   ├── panel_data.py        # Multichannel OHLCV + market/VIX panel windows
+│   ├── panel_model.py       # Conditional multichannel diffusion (PanelDiffusion)
+│   ├── train_panel.py       # Train/eval ticker + market panel models
+│   ├── panel_assembly.py    # Scenario panels → OHLCV (FinRL-Meta raw schema)
+│   ├── panel_eval.py        # Cross-sectional panel evaluation
 │   ├── data.py              # Data pipeline: raw prices → sliding windows
 │   ├── metrics.py           # Stylized facts: Hill estimator, ACF, plots
 │   ├── run.py               # CLI entry point
