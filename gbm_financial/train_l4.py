@@ -283,7 +283,7 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None,
 def _sample(model, config, n, seed):
     sampler = config.get("sampler", "pc")
     fn = {"karras": model.generate_karras, "em": model.generate_em,
-          "ode": model.generate_ode}.get(sampler, model.generate)
+          "ode": model.generate_ode, "hybrid": model.generate_hybrid}.get(sampler, model.generate)
     return fn(n_samples=n, seq_len=config["seq_len"], seed=seed)
 
 
@@ -460,8 +460,10 @@ def main():
     parser.add_argument("--spectral-loss", type=float, default=None, metavar="WEIGHT",
                         help="Enable spectral auxiliary loss with given weight λ (e.g. 0.1)")
     parser.add_argument("--sampler", type=str, default=None,
-                        choices=["pc", "karras", "em", "ode"],
+                        choices=["pc", "karras", "em", "ode", "hybrid"],
                         help="Sampling method for generation (default: pc)")
+    parser.add_argument("--hybrid_sigma_switch", type=float, default=None,
+                        help="Hybrid sampler: σ below which the stochastic SDE takes over")
     parser.add_argument("--karras-rho", type=float, default=None,
                         help="Karras sigma schedule exponent ρ (default: 7)")
     parser.add_argument("--warmstart", type=str, default=None,
@@ -518,6 +520,8 @@ def main():
         config["sampler"] = args.sampler
     if args.karras_rho is not None:
         config["karras_rho"] = args.karras_rho
+    if args.hybrid_sigma_switch is not None:
+        config["hybrid_sigma_switch"] = args.hybrid_sigma_switch
     if args.sigma_min is not None:
         config["sigma_min"] = args.sigma_min
     if args.data_mode:

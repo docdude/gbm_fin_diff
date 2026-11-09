@@ -105,8 +105,10 @@ def main():
     parser.add_argument("--save-dir", type=str, default=None,
                         help="Output directory (default: alongside checkpoint)")
     parser.add_argument("--sampler", type=str, default="pc",
-                        choices=["pc", "em", "ode", "karras"],
+                        choices=["pc", "em", "ode", "karras", "hybrid"],
                         help="Sampling method: pc (Langevin), em (Euler-Maruyama), ode, karras (Heun 2nd-order)")
+    parser.add_argument("--hybrid-sigma-switch", type=float, default=None,
+                        help="Hybrid sampler: σ below which the stochastic SDE takes over")
     parser.add_argument("--karras-rho", type=float, default=None,
                         help="Karras sigma schedule exponent (default: 7)")
     parser.add_argument("--n-generate", type=int, default=60)
@@ -188,6 +190,8 @@ def main():
         config["sampling_eps"] = args.eps
     if args.karras_rho is not None:
         config["karras_rho"] = args.karras_rho
+    if args.hybrid_sigma_switch is not None:
+        config["hybrid_sigma_switch"] = args.hybrid_sigma_switch
     for arg, key in ((args.noise_scale, "sampler_noise_scale"),
                      (args.noise_sigma_min, "sampler_noise_sigma_min"),
                      (args.noise_sigma_max, "sampler_noise_sigma_max")):
@@ -251,6 +255,11 @@ def main():
         generated = model.generate_ode(n_samples=args.n_generate, seed=args.seed,
                                        seq_len=window_len,
                                        batch_size=args.batch_size)
+    elif args.sampler == "hybrid":
+        sampler_label = f"Hybrid (σ_switch={config.get('hybrid_sigma_switch', 0.1)})"
+        generated = model.generate_hybrid(n_samples=args.n_generate, seed=args.seed,
+                                          seq_len=window_len,
+                                          batch_size=args.batch_size)
     elif args.sampler == "karras":
         sampler_label = f"Karras/Heun (ρ={config.get('karras_rho', 7)})"
         generated = model.generate_karras(n_samples=args.n_generate, seed=args.seed,

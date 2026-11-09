@@ -480,9 +480,10 @@ def test_sampler_oracle(verbose=True, data_std=0.3, tol=0.10):
         "n_layers": 1, "n_heads": 2, "sigma_min": 1e-3, "sigma_max": 5.0,
         "n_reverse_steps": 400, "epochs": 1, "batch_size": 8, "lr": 1e-3,
         "ema_decay": 0.0, "seq_len": 64, "sampling_eps": 1e-5,
+        "hybrid_ode_steps": 100, "hybrid_sde_steps": 300,
     }
     combos = [("gbm", sch, smp) for sch in ("exponential", "cosine", "linear")
-              for smp in ("pc", "em", "ode", "karras")]
+              for smp in ("pc", "em", "ode", "karras", "hybrid")]
     combos += [("vp", sch, smp) for sch in ("exponential", "cosine", "linear")
                for smp in ("pc", "em", "ode")]
 
@@ -492,8 +493,8 @@ def test_sampler_oracle(verbose=True, data_std=0.3, tol=0.10):
                    normalize_mode="none")
         pipe = GBMFinancialDiffusion(cfg, device=torch.device("cpu"))
         pipe.model = _GaussianOracle(pipe.sde, data_std)
-        fn = {"pc": pipe.generate, "em": pipe.generate_em,
-              "ode": pipe.generate_ode, "karras": pipe.generate_karras}[sampler]
+        fn = {"pc": pipe.generate, "em": pipe.generate_em, "ode": pipe.generate_ode,
+              "karras": pipe.generate_karras, "hybrid": pipe.generate_hybrid}[sampler]
         out = fn(n_samples=64, seq_len=64, batch_size=64, seed=0)
         ratio = out.std() / data_std
         ok = np.isfinite(out).all() and abs(ratio - 1) < tol
@@ -544,7 +545,8 @@ def test_edm_precond(verbose=True, n_epochs=25):
         decreased = losses[-1] < 0.9 * losses[0]  # EDM loss has a high irreducible floor
         outs = {}
         for name, fn in (("pc", pipe.generate), ("em", pipe.generate_em),
-                         ("ode", pipe.generate_ode), ("karras", pipe.generate_karras)):
+                         ("ode", pipe.generate_ode), ("karras", pipe.generate_karras),
+                         ("hybrid", pipe.generate_hybrid)):
             g = fn(n_samples=8, seq_len=64, batch_size=8, seed=0)
             outs[name] = bool(np.isfinite(g).all())
         with tempfile.TemporaryDirectory() as d:

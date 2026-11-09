@@ -896,6 +896,71 @@ class GBMFinancialDiffusion:
         return self._finish_sampling(all_samples, n_samples, "Karras/Heun")
 
     @torch.no_grad()
+    def generate_hybrid(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
+        """Deterministic Heun above σ_switch, stochastic reverse SDE below it.
+
+        High noise levels set the path's coarse shape (overall swing, terminal
+        spread); there the PF-ODE (Heun on the EDM σ grid) avoids the runaway
+        paths that stochastic sampling produces. Below σ_switch the PC
+        reverse-diffusion predictor takes over and removes the high-frequency
+        jitter a deterministic solve leaves at the finest levels. Ends with a
+        Tweedie denoise. VE/GBM only.
+
+        Config: hybrid_sigma_switch (0.1), hybrid_ode_steps (100),
+        hybrid_sde_steps (1000), karras_rho (7).
+        """
+        if self._is_vp:
+            raise ValueError("Hybrid sampler is only implemented for VE/GBM SDEs")
+
+        self._begin_sampling(seed)
+        seq_len = seq_len or self.config["seq_len"]
+        batch_size = batch_size or min(n_samples, 32)
+        sw = float(self.config.get("hybrid_sigma_switch", 0.1))
+        n_ode = int(self.config.get("hybrid_ode_steps", 100))
+        n_sde = int(self.config.get("hybrid_sde_steps", 1000))
+        rho = self.config.get("karras_rho", 7)
+        eps = self.config.get("sampling_eps", 1e-5)
+        smax = self.sde.sigma_max
+        s_end = float(self.sde._sigma(torch.tensor(float(eps))))
+        sw = min(max(sw, s_end), smax)
+
+        k = torch.arange(n_ode, dtype=torch.float64)
+        sig_ode = ((smax ** (1 / rho) + k / max(n_ode - 1, 1) *
+                    (sw ** (1 / rho) - smax ** (1 / rho))) ** rho).float().to(self.device)
+        t_ode = self.sde.t_from_sigma(sig_ode).to(self.device)
+        sig_sde = torch.exp(torch.linspace(math.log(sw), math.log(s_end), n_sde)).to(self.device)
+        t_sde = self.sde.t_from_sigma(sig_sde).to(self.device)
+        sig_sde_next = torch.cat([sig_sde[1:], torch.zeros(1, device=self.device)])
+
+        print(f"\nGenerating {n_samples} samples (hybrid: Heun {n_ode} steps σ {smax:.3g}→{sw:.3g}, "
+              f"reverse SDE {n_sde} steps σ {sw:.3g}→0)...")
+
+        all_samples, n_remaining = [], n_samples
+        while n_remaining > 0:
+            B = min(batch_size, n_remaining)
+            x = self.sde.prior_sampling((B, seq_len)).to(self.device)
+
+            for i in tqdm(range(n_ode - 1), desc="Hybrid/Heun", leave=False, mininterval=2.0):
+                h = sig_ode[i + 1] - sig_ode[i]
+                d_cur = self.model(x, torch.full((B,), t_ode[i].item(), device=self.device))
+                x_hat = x + h * d_cur
+                d_next = self.model(x_hat, torch.full((B,), t_ode[i + 1].item(), device=self.device))
+                x = x + h * 0.5 * (d_cur + d_next)
+
+            for i in tqdm(range(n_sde), desc="Hybrid/SDE", leave=False, mininterval=2.0):
+                sigma = sig_sde[i]
+                eps_pred = self.model(x, torch.full((B,), t_sde[i].item(), device=self.device))
+                g_sq = sigma ** 2 - sig_sde_next[i] ** 2
+                x = x - g_sq / sigma * eps_pred
+                if i < n_sde - 1:
+                    x = x + self._noise_scale(sigma) * torch.sqrt(g_sq) * torch.randn_like(x)
+
+            all_samples.append(x.cpu().numpy())
+            n_remaining -= B
+
+        return self._finish_sampling(all_samples, n_samples, "hybrid")
+
+    @torch.no_grad()
     def generate_ode(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
         """Probability-flow ODE (Euler), dX = [f − ½g²·score] dt, followed by
         a final Tweedie denoise at t=eps. Works for VE/GBM and VP."""

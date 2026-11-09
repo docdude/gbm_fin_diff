@@ -189,6 +189,8 @@ def generate_from_checkpoint(config, checkpoint_path, save_dir):
         generated = model.generate_em(n_samples=n_gen, seq_len=config["seq_len"])
     elif sampler == "ode":
         generated = model.generate_ode(n_samples=n_gen, seq_len=config["seq_len"])
+    elif sampler == "hybrid":
+        generated = model.generate_hybrid(n_samples=n_gen, seq_len=config["seq_len"])
     else:
         generated = model.generate(n_samples=n_gen, seq_len=config["seq_len"])
 
