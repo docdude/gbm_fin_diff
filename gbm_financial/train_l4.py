@@ -184,7 +184,7 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None,
         batch_size=config["batch_size"],
         use_synthetic=config.get("use_synthetic", False),
         min_years=config.get("min_years", 40),
-        num_workers=2,
+        num_workers=0,
         data_mode=config.get("data_mode", "log_price"),
         split=config.get("split", "ticker"),
         seed=config.get("seed", 0),
@@ -281,10 +281,17 @@ def run_experiment(config, save_dir, resume_path=None, warmstart_path=None,
 
 
 def _sample(model, config, n, seed):
-    sampler = config.get("sampler", "pc")
-    fn = {"karras": model.generate_karras, "em": model.generate_em,
-          "ode": model.generate_ode, "hybrid": model.generate_hybrid}.get(sampler, model.generate)
-    return fn(n_samples=n, seq_len=config["seq_len"], seed=seed)
+    return model.sample(n_samples=n, seq_len=config["seq_len"], seed=seed)
+
+
+def set_reject_threshold(config, train_loader, data_mode):
+    """reject_failed → reject_ac1_below = 0.1th pct of real per-path lag-1 ACF."""
+    if config.get("reject_failed") and config.get("reject_ac1_below") is None:
+        ac1 = GBMFinancialDiffusion.path_lag1_autocorr(
+            train_loader.dataset.data.numpy(), data_mode)
+        config["reject_ac1_below"] = float(np.percentile(ac1, 0.1))
+        print(f"  Failed-sample filter: reject paths with lag-1 ACF < "
+              f"{config['reject_ac1_below']:.3f} (real 0.1th pct)")
 
 
 def evaluate_model(model, config, train_loader, val_loader, exp_dir):
@@ -296,15 +303,19 @@ def evaluate_model(model, config, train_loader, val_loader, exp_dir):
     mode = model.data_mode
     n_gen = config.get("n_generate", 120)
     seeds = [config.get("seed", 0) + k for k in range(config.get("n_seeds", 3))]
+    set_reject_threshold(config, train_loader, mode)
+    model.config.update({k: config[k] for k in ("reject_ac1_below",) if k in config})
+    os.makedirs(exp_dir, exist_ok=True)
 
     real_train = np.concatenate([b.numpy() for b in train_loader.dataset.data.split(512)], 0)
     real_val = np.concatenate([b.numpy() for b in val_loader.dataset.data.split(512)], 0)
     np.save(os.path.join(exp_dir, "real_train.npy"), real_train)
     np.save(os.path.join(exp_dir, "real_val.npy"), real_val)
 
-    gens = []
+    gens, rejection = [], []
     for sd in seeds:
         g = _sample(model, config, n_gen, sd)
+        rejection.append(getattr(model, "last_rejection_rate", 0.0))
         np.save(os.path.join(exp_dir, f"generated_seed{sd}.npy"), g)
         gens.append(g)
     np.save(os.path.join(exp_dir, "generated_data.npy"), gens[0])
@@ -312,6 +323,12 @@ def evaluate_model(model, config, train_loader, val_loader, exp_dir):
     real_r = to_returns(real_train, mode)
     val_r = to_returns(real_val, mode)
     label = f"ours: {config['sde_type']}+{config['schedule']}"
+    if config.get("precond", "none") != "none":
+        label += f" {config['precond']}"
+    if config.get("sampler", "pc") != "pc":
+        label += f" {config['sampler']}"
+    if config.get("reject_ac1_below") is not None:
+        label += " +filter"
     cmp = run_comparison(real_r, {label: [to_returns(g, mode) for g in gens]},
                          holdout_r=val_r, baselines=True, n_baseline=n_gen)
     table = format_report(cmp)
@@ -327,6 +344,8 @@ def evaluate_model(model, config, train_loader, val_loader, exp_dir):
     ours = cmp[label]
     return {
         "seeds": seeds,
+        "sampler": config.get("sampler", "pc"),
+        "rejection_rate": float(np.mean(rejection)),
         "metrics": {k: v["mean"] for k, v in ours.items()},
         "metrics_std": {k: v["std"] for k, v in ours.items()},
         "alpha_gen": ours["alpha_top5"]["mean"],
@@ -334,6 +353,46 @@ def evaluate_model(model, config, train_loader, val_loader, exp_dir):
         "beta_gen": ours["vol_cluster_beta"]["mean"],
         "beta_real": ours["vol_cluster_beta_real"]["mean"],
     }
+
+
+def run_eval_only(cli_config, save_dir, tag=None):
+    """Re-score an existing experiment with new sampler settings (no training).
+
+    Loads <save_dir>/<sde>_<schedule>/results.json config + best_model.pth,
+    applies sampler-related overrides from the CLI and writes all outputs to
+    <exp_dir>/eval_<tag>/.
+    """
+    exp_dir = os.path.join(save_dir, f"{cli_config['sde_type']}_{cli_config['schedule']}")
+    with open(os.path.join(exp_dir, "results.json")) as f:
+        config = json.load(f)["config"]
+    for k in ("sampler", "hybrid_sigma_switch", "hybrid_ode_steps", "hybrid_sde_steps",
+              "karras_rho", "n_reverse_steps", "sampling_eps", "pc_corrector_steps",
+              "sampler_noise_scale", "sampler_noise_sigma_min", "sampler_noise_sigma_max",
+              "reject_failed", "reject_ac1_below", "n_generate", "n_seeds", "seed"):
+        if k in cli_config and cli_config[k] is not None:
+            config[k] = cli_config[k]
+    tag = tag or f"{config.get('sampler', 'pc')}" + (
+        f"_{config['hybrid_sigma_switch']:g}" if config.get("sampler") == "hybrid" else "") + (
+        "_filter" if config.get("reject_failed") else "")
+    out_dir = os.path.join(exp_dir, f"eval_{tag}")
+
+    train_loader, val_loader, _ = get_dataloaders(
+        sde_type=config["sde_type"], window_len=config["seq_len"],
+        stride=config.get("stride", 400), batch_size=config["batch_size"],
+        min_years=config.get("min_years", 40), num_workers=0,
+        data_mode=config.get("data_mode", "log_price"),
+        split=config.get("split", "ticker"), seed=config.get("seed", 0))
+    model = GBMFinancialDiffusion(config)
+    ckpt = os.path.join(exp_dir, "best_model.pth")
+    if not os.path.exists(ckpt):
+        ckpt = os.path.join(exp_dir, "final_model.pth")
+    model.load(ckpt)
+    results = evaluate_model(model, config, train_loader, val_loader, out_dir)
+    results["checkpoint"] = ckpt
+    results["config"] = {k: v for k, v in config.items() if isinstance(v, (int, float, str, bool))}
+    with open(os.path.join(out_dir, "results.json"), "w") as f:
+        json.dump(results, f, indent=2, default=str)
+    return results
 
 
 def run_grid(base_config, save_dir):
@@ -464,6 +523,14 @@ def main():
                         help="Sampling method for generation (default: pc)")
     parser.add_argument("--hybrid_sigma_switch", type=float, default=None,
                         help="Hybrid sampler: σ below which the stochastic SDE takes over")
+    parser.add_argument("--reject_failed", action="store_true",
+                        help="Reject failed samples (lag-1 return ACF below the real "
+                             "0.1th percentile) and resample")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Skip training: re-score <save_dir>/<sde>_<schedule>/best_model.pth "
+                             "with the given sampler settings (outputs in eval_<tag>/)")
+    parser.add_argument("--eval_tag", type=str, default=None,
+                        help="Output subdirectory suffix for --eval_only")
     parser.add_argument("--karras-rho", type=float, default=None,
                         help="Karras sigma schedule exponent ρ (default: 7)")
     parser.add_argument("--warmstart", type=str, default=None,
@@ -522,6 +589,8 @@ def main():
         config["karras_rho"] = args.karras_rho
     if args.hybrid_sigma_switch is not None:
         config["hybrid_sigma_switch"] = args.hybrid_sigma_switch
+    if args.reject_failed:
+        config["reject_failed"] = True
     if args.sigma_min is not None:
         config["sigma_min"] = args.sigma_min
     if args.data_mode:
@@ -556,6 +625,18 @@ def main():
 
     # Ensure data
     ensure_data(config)
+
+    if args.eval_only:
+        cli = {k: v for k, v in config.items()}
+        if not args.sampler:
+            cli.pop("sampler", None)
+        for k in ("n_reverse_steps", "sampling_eps", "pc_corrector_steps", "sampler_noise_scale",
+                  "n_generate", "n_seeds", "seed"):
+            if getattr(args, {"n_reverse_steps": "n_reverse", "sampler_noise_scale": "noise_scale"}
+                       .get(k, k), None) is None:
+                cli.pop(k, None)
+        run_eval_only(cli, args.save_dir, args.eval_tag)
+        return
 
     # Run
     if args.grid:

@@ -209,7 +209,7 @@ def main():
         stride=stride,
         batch_size=config.get("batch_size", 64),
         min_years=config.get("min_years", 40),
-        num_workers=2,
+        num_workers=0,
         data_mode=mode,
         split=config.get("split", "ticker"),
         seed=config.get("seed", 0),

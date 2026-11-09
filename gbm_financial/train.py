@@ -895,6 +895,55 @@ class GBMFinancialDiffusion:
 
         return self._finish_sampling(all_samples, n_samples, "Karras/Heun")
 
+    @staticmethod
+    def path_lag1_autocorr(paths, data_mode="log_price"):
+        """Per-path lag-1 autocorrelation of returns, shape (N,)."""
+        r = np.diff(paths, axis=1) if data_mode == "log_price" else np.asarray(paths)
+        rc = r - r.mean(axis=1, keepdims=True)
+        var = (rc ** 2).mean(axis=1)
+        return (rc[:, 1:] * rc[:, :-1]).mean(axis=1) / np.maximum(var, 1e-20)
+
+    def sample(self, n_samples=120, seq_len=None, batch_size=None, seed=None,
+               sampler=None, max_rounds=10):
+        """Generate with config["sampler"], optionally rejecting failed samples.
+
+        If config["reject_ac1_below"] is set, paths whose lag-1 return
+        autocorrelation falls below it are discarded and replaced. Failed
+        samples carry residual white noise in the levels (ac1 ≈ −0.2…−0.5);
+        the threshold is set from real data (e.g. its 0.1th percentile) so
+        realistic paths are essentially never rejected. The rejection rate is
+        stored in self.last_rejection_rate.
+        """
+        sampler = sampler or self.config.get("sampler", "pc")
+        fn = {"pc": self.generate, "em": self.generate_em, "ode": self.generate_ode,
+              "karras": self.generate_karras, "hybrid": self.generate_hybrid}[sampler]
+        thr = self.config.get("reject_ac1_below")
+        if thr is None:
+            self.last_rejection_rate = 0.0
+            return fn(n_samples=n_samples, seq_len=seq_len, batch_size=batch_size, seed=seed)
+
+        kept, n_drawn, n_rejected = [], 0, 0
+        need = n_samples
+        for r in range(max_rounds):
+            n_try = int(np.ceil(need * 1.15)) + 4
+            s = None if seed is None else seed + 1000 * r
+            g = fn(n_samples=n_try, seq_len=seq_len, batch_size=batch_size, seed=s)
+            ok = self.path_lag1_autocorr(g, self.data_mode) >= thr
+            n_drawn += len(g)
+            n_rejected += int((~ok).sum())
+            kept.append(g[ok])
+            need = n_samples - sum(len(k) for k in kept)
+            if need <= 0:
+                break
+        out = np.concatenate(kept, axis=0)
+        if len(out) < n_samples:
+            raise RuntimeError(f"Only {len(out)}/{n_samples} samples passed the "
+                               f"ac1 ≥ {thr:.3f} filter after {max_rounds} rounds")
+        self.last_rejection_rate = n_rejected / max(n_drawn, 1)
+        print(f"  Rejected {n_rejected}/{n_drawn} failed samples "
+              f"({100 * self.last_rejection_rate:.1f}%, ac1 < {thr:.3f})")
+        return out[:n_samples]
+
     @torch.no_grad()
     def generate_hybrid(self, n_samples=120, seq_len=None, batch_size=None, seed=None):
         """Deterministic Heun above σ_switch, stochastic reverse SDE below it.
