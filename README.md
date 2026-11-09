@@ -71,6 +71,43 @@ All metrics are computed within windows (generated windows are independent),
 averaged over sampling seeds, and reported next to iid-shuffle, block-bootstrap
 and GARCH(1,1)-t baselines plus a held-out-ticker "real vs real" row.
 
+### Recommended generator (EDM + ε-model splice)
+
+The best-validated setup combines two trained models that share the same noise
+schedule (σ ∈ [1e-3, 12.56], exponential):
+
+```bash
+# 1. ε-prediction model (fine-scale structure)
+python -m gbm_financial.train_l4 --save_dir save/fixed
+# 2. EDM-preconditioned model (coarse structure: scale, drift, terminal spread)
+python -m gbm_financial.train_l4 --save_dir save/edm_scalar --precond edm \
+    --sigma_max 12.561595916748047
+# 3. Generate/score: EDM Heun σ 12.6→0.5, EDM SDE 0.5→0.03, ε-model SDE below 0.03,
+#    rejecting failed samples (lag-1 return ACF below the real 0.1th percentile)
+python -m gbm_financial.train_l4 --eval_only --save_dir save/edm_scalar \
+    --sampler hybrid --hybrid_sigma_switch 0.5 --reject_failed \
+    --hybrid_fine_checkpoint save/fixed/gbm_exponential/best_model.pth --hybrid_fine_sigma 0.03
+```
+
+From Python: build `GBMFinancialDiffusion` from the run's `results.json` config, `load()` the
+checkpoint, set the same sampler keys in `model.config`, and call `model.sample(n)`.
+
+Results (3 seeds × 120 paths of 2048 days; 104 S&P stocks, 10 tickers held out):
+
+| | std× | kurt | α | ACF r₁ | ACF\|r\| | β | leverage | volDisp | discAUC | NN× |
+|---|---|---|---|---|---|---|---|---|---|---|
+| real (train) | 1 | 41.5 | 2.90 | −0.010 | 0.156 | 0.40 | −5.2 | 0.29 | – | 1 |
+| real held-out tickers | 1.04 | 18.7 | 2.99 | −0.013 | 0.141 | 0.38 | −4.0 | 0.25 | 0.843 | 1.02 |
+| **splice (above)** | 0.90 | 24.7 | 2.67 | −0.022 | 0.157 | 0.34 | −4.4 | 0.39 | **0.843** | 1.13 |
+| ε-model only | 0.70 | 18.0 | 2.88 | −0.019 | 0.157 | 0.40 | −6.8 | 0.23 | 0.897 | 0.89 |
+| block bootstrap | 1.00 | 26.7 | 2.83 | −0.006 | 0.161 | 1.96 | −4.4 | 0.11 | 0.986 | 1.11 |
+| GARCH(1,1)-t | 1.14 | 69 | 2.42 | 0.001 | 0.198 | 0.34 | +2.3 | 0.40 | 0.914 | 1.36 |
+
+discAUC is a classifier's ability to tell generated from real windows; the held-out row is the
+floor (a classifier also separates *different real tickers* at this window length). About 5% of
+generated paths are rejected by the filter. Known residual gaps: return scale ×0.9, terminal
+spread ×1.3, mean 2048-day drift 0.70 vs 0.95, clustering decay β slightly fast.
+
 ### Train on S&P 500 data
 
 ```bash
@@ -144,7 +181,7 @@ $$dx = \sigma(t) \, dw, \quad \sigma(t) = \sigma_{\min} \left(\frac{\sigma_{\max
 
 $$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left[ \left\| s_\theta(x_t, t) + \frac{\epsilon}{\sigma(t)} \right\|^2 \right]$$
 
-**Sampling**: predictor-corrector (default), Euler–Maruyama, probability-flow ODE, or Karras/Heun, N=2000 steps. VE/GBM samplers step on a grid geometric in σ mapped through each schedule's exact inverse, and every sampler ends with a Tweedie denoise, so results no longer depend on `sampling_eps`.
+**Sampling**: predictor-corrector (default), Euler–Maruyama, probability-flow ODE, Karras/Heun, or a hybrid (deterministic Heun at high noise, reverse SDE at low noise, optional model splice), N=2000 steps. VE/GBM samplers step on a grid geometric in σ mapped through each schedule's exact inverse, and every sampler ends with a Tweedie denoise, so results no longer depend on `sampling_eps`.
 
 ### Implementation notes (deviations and clarifications)
 
@@ -155,6 +192,8 @@ $$\mathcal{L} = \mathbb{E}_{t, x_0, \epsilon} \left[ \left\| s_\theta(x_t, t) + 
 - **Raw prices:** `data/financial/sp500_prices_raw.pkl` stores unprocessed closes. Only one-day spike-and-revert bad ticks are repaired; real crashes (1987, AIG 2008, …) are kept. The legacy `sp500_prices.pkl` cache zeroed every return beyond 5σ and is ignored.
 - **Validation split:** whole tickers are held out (`split="ticker"`), so overlapping windows cannot leak between train and validation.
 - **Tail exponent:** α is a Hill estimate on the top 5% of |r|. The older √n-k estimate is still reported as `alpha_hill_sqrtn`.
+- **EDM preconditioning (`--precond edm`):** Karras et al. (2022) input/skip/output scaling and loss weighting around the same CSDI network. It fixes the ε-model's under-dispersion (return scale ×0.70) but produces a few failed samples under purely stochastic sampling, hence the hybrid sampler and `--reject_failed`.
+- **Validation loss** uses stratified diffusion times and fixed noise, so `best_model.pth` selection is deterministic.
 
 ## Vendored Dependencies
 
