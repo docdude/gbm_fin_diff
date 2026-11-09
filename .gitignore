@@ -44,3 +44,7 @@ Thumbs.db
 
 # Third-party repos cloned for comparisons
 external/
+
+# Secrets (API keys)
+.env
+.env.*
