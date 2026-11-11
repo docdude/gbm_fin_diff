@@ -1,12 +1,17 @@
 """Multichannel panel data for market-conditioned synthetic OHLCV generation.
 
-Per ticker, aligned on the trading calendar:
-    c0  anchored log-price      cumsum of vol-normalised log returns (0 at window start)
-    c1  log range               log(log(H/L)), centred/scaled per ticker
-    c2  relative log volume     log V − trailing 252-day median of log V (causal), scaled
-Market (conditioning / market-model targets):
-    m0  anchored market log-price  equal-weight mean of available tickers' returns
-    m1  log VIX                    centred/scaled
+Ticker windows (K=7), all statistics causal at the window start s:
+    c0  anchored log-price   cumsum of returns / trailing 252-day vol at s
+    c1  log range            log(log(H/L)) − its trailing 252-day mean at s
+    c2  log volume           log V − trailing 252-day median of log V at s
+    m0  anchored market log-price  (equal-weight mean of available tickers' returns)
+    m1  log VIX
+    b   ticker trailing 252-day beta to the market at s      (constant channel)
+    r   ticker trailing 252-day correlation to the market at s (constant channel)
+Channels 3-6 are conditioning. Normalising by trailing (era-correct) statistics and
+conditioning on the ticker's beta/correlation lets one pooled model generate
+ticker-specific behaviour; inversion uses the same statistics from real data before
+the scenario start.
 
 Every channel is scaled so its day-to-day change has std SCALE (=0.017, the
 S&P daily-return scale the noise schedule was calibrated on); per-ticker
@@ -23,6 +28,9 @@ import pandas as pd
 
 SCALE = 0.017
 TICKER_CHANNELS = ("logprice", "logrange", "logvol")
+STATE_CHANNELS = ("beta", "corr")
+TRAIL_DAYS = 252
+TRAIL_MIN = 60
 MARKET_CHANNELS = ("market_logprice", "log_vix")
 RANGE_FLOOR = 2e-3        # floor for log(H/L) (degenerate H==L days in old data)
 VOL_BASELINE_DAYS = 252
@@ -124,6 +132,22 @@ class PanelData:
         self.m_ret = self.mret / self.mstats["mret_std"] * SCALE
         self.m_vix = (lv - self.mstats["lvix_mean"]) / self.mstats["lvix_dstd"] * SCALE
 
+        # Causal trailing statistics (value at s uses data up to and including s)
+        R = pd.DataFrame(ret)
+        roll = dict(window=TRAIL_DAYS, min_periods=TRAIL_MIN)
+        self.tr_vol = R.rolling(**roll).std().to_numpy()
+        self.tr_rmean = pd.DataFrame(rng).rolling(**roll).mean().to_numpy()
+        M = pd.Series(self.mret)
+        mv = M.rolling(**roll).var().to_numpy()
+        mm = M.rolling(**roll).mean().to_numpy()
+        rm = R.rolling(**roll).mean().to_numpy()
+        RM = R.mul(M, axis=0)
+        rmm = RM.rolling(**roll).mean().to_numpy()
+        n = RM.notna().astype(float).rolling(**roll).sum().to_numpy()
+        cov = (rmm - rm * mm[:, None]) * n / np.maximum(n - 1, 1)  # sample covariance
+        self.tr_beta = cov / mv[:, None]
+        self.tr_corr = cov / (self.tr_vol * np.sqrt(mv)[:, None])
+
     # ------------------------------------------------------------------
     def ticker_valid(self, j):
         """Boolean (T,) mask of days where every ticker channel is defined."""
@@ -136,22 +160,55 @@ class PanelData:
         r[0] = 0.0
         return np.stack([np.cumsum(r), self.m_vix[start:start + L]])
 
+    def window_stats(self, j, s, fallback=True):
+        """Causal per-ticker statistics at index s (dict), or None if unavailable.
+
+        With fallback=True, a ticker without enough history at s (not yet
+        listed) uses its earliest available statistics."""
+        def get(i):
+            st = {"vol": self.tr_vol[i, j], "rmean": self.tr_rmean[i, j],
+                  "vbase": self.lvol_base[i, j], "beta": self.tr_beta[i, j],
+                  "corr": self.tr_corr[i, j]}
+            return st if all(np.isfinite(v) for v in st.values()) and st["vol"] > 0 else None
+        st = get(s)
+        if st is None and fallback:
+            ok = np.where(np.isfinite(self.tr_vol[:, j]) & np.isfinite(self.tr_beta[:, j])
+                          & np.isfinite(self.lvol_base[:, j]) & np.isfinite(self.tr_rmean[:, j]))[0]
+            st = get(ok[0]) if len(ok) else None
+        return st
+
+    @staticmethod
+    def state_channels(st, L):
+        return np.stack([np.full(L, (st["beta"] - 1.0) * 0.25),
+                         np.full(L, (st["corr"] - 0.5) * 0.5)])
+
+    def ticker_channels(self, j, s, L, st):
+        """[c0, c1, c2] for ticker j over [s, s+L) normalised with stats st."""
+        r = self.ret[s:s + L, j] / st["vol"] * SCALE
+        r = r.copy()
+        r[0] = 0.0
+        c1 = (self.lrange[s:s + L, j] - st["rmean"]) / self.stats["lrange_dstd"][j] * SCALE
+        c2 = (np.log(self.volume[s:s + L, j]) - st["vbase"]) / self.stats["lvol_dstd"][j] * SCALE
+        return np.stack([np.cumsum(r), c1, c2])
+
     def ticker_windows(self, tickers, L=512, stride=64):
-        """(N, 5, L) windows [c0, c1, c2, m0, m1] + metadata for the given tickers."""
+        """(N, 7, L) windows [c0, c1, c2, m0, m1, beta, corr] + metadata."""
         out, meta = [], []
+        T = len(self.dates)
         for tic in tickers:
             j = self.tickers.index(tic)
             ok = self.ticker_valid(j)
-            T = len(self.dates)
-            starts = range(0, T - L + 1, stride)
-            for s in starts:
-                if not ok[s + 1:s + L].all() or not np.isfinite(self.c_range[s, j]) \
-                        or not np.isfinite(self.c_vol[s, j]):
+            for s in range(0, T - L + 1, stride):
+                if not ok[s + 1:s + L].all() or not np.isfinite(self.lrange[s, j]) \
+                        or not (self.volume[s:s + L, j] > 0).all():
                     continue
-                r = self.c_ret[s:s + L, j].copy()
-                r[0] = 0.0
-                tw = np.stack([np.cumsum(r), self.c_range[s:s + L, j], self.c_vol[s:s + L, j]])
-                out.append(np.concatenate([tw, self.market_window(s, L)]))
+                st = self.window_stats(j, s, fallback=False)
+                if st is None:
+                    continue
+                tw = self.ticker_channels(j, s, L, st)
+                if not np.isfinite(tw).all():
+                    continue
+                out.append(np.concatenate([tw, self.market_window(s, L), self.state_channels(st, L)]))
                 meta.append((tic, self.dates[s]))
         X = np.asarray(out, dtype=np.float32)
         return X, meta

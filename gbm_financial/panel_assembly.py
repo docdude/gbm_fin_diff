@@ -95,40 +95,48 @@ class PanelGenerator:
         return self.mm.sample_panel(1, self.L, cond=None, seed=seed)[0]
 
     # -- tickers ------------------------------------------------------------
-    def ticker_paths(self, market, tickers, seed=None):
+    def ticker_paths(self, market, tickers, stats, seed=None):
         n = len(tickers)
-        cond = np.zeros((n, 5, self.L), dtype=np.float32)
-        cond[:, 3:] = market[None]
+        K = int(self.tm.config["n_channels"])
+        cond = np.zeros((n, K, self.L), dtype=np.float32)
+        cond[:, 3:5] = market[None]
+        if K == 7:
+            for i, st in enumerate(stats):
+                cond[i, 5:] = self.P.state_channels(st, self.L)
         return self.tm.sample_panel(n, self.L, cond=cond, seed=seed, chunk=n)[:, :3]
 
     # -- inversion ----------------------------------------------------------
-    def _anchor(self, j, ref_idx):
-        P = self.P
-        c = P.close[:ref_idx + 1, j]
+    def _anchor_close(self, j, ref_idx):
+        c = self.P.close[:ref_idx + 1, j]
         ok = np.where(np.isfinite(c))[0]
-        k = ok[-1] if len(ok) else np.where(np.isfinite(P.close[:, j]))[0][0]
-        base = P.lvol_base[:ref_idx + 1, j]
-        okb = np.where(np.isfinite(base))[0]
-        b = base[okb[-1]] if len(okb) else np.nanmedian(P.lvol_base[:, j])
-        return P.close[k, j], b
+        k = ok[-1] if len(ok) else np.where(np.isfinite(self.P.close[:, j]))[0][0]
+        return self.P.close[k, j]
 
-    def to_ohlcv(self, paths, market, tickers, dates, ref_idx):
+    def stats_for(self, tickers, s):
+        return [self.P.window_stats(self.P.tickers.index(t), s) for t in tickers]
+
+    def to_ohlcv(self, paths, market, tickers, dates, ref_idx, stats=None):
+        """Invert channels to OHLCV. stats: per-ticker window_stats at the window
+        start (default: computed at ref_idx + 1)."""
         P, S = self.P, self.P.stats
+        if stats is None:
+            stats = self.stats_for(tickers, ref_idx + 1)
         rows = []
         for i, tic in enumerate(tickers):
             j = P.tickers.index(tic)
+            st = stats[i]
             c0, lr, lv = paths[i]
-            ret = np.diff(c0) / SCALE * S["ret_std"][j]
-            c_start, vbase = self._anchor(j, ref_idx)
+            ret = np.diff(c0) / SCALE * st["vol"]
+            c_start = self._anchor_close(j, ref_idx)
             close = c_start * np.exp(np.r_[0.0, np.cumsum(ret)])
-            hl = np.exp(lr / SCALE * S["lrange_dstd"][j] + S["lrange_mean"][j])
-            z = np.r_[0.0, ret / S["ret_std"][j]]
+            hl = np.exp(lr / SCALE * S["lrange_dstd"][j] + st["rmean"])
+            z = np.r_[0.0, ret / st["vol"]]
             a, g = self.emp.sample(z, self.rng)
             high = close * np.exp(a * hl)
             low = high * np.exp(-hl)
             prev = np.r_[close[0], close[:-1]]
-            open_ = np.clip(prev * np.exp(g * S["ret_std"][j]), low, high)
-            volume = np.exp(lv / SCALE * S["lvol_dstd"][j] + S["lvol_mean"][j] + vbase)
+            open_ = np.clip(prev * np.exp(g * st["vol"]), low, high)
+            volume = np.exp(lv / SCALE * S["lvol_dstd"][j] + st["vbase"])
             rows.append(pd.DataFrame({"date": dates, "open": open_, "high": high, "low": low,
                                       "close": close, "adjusted_close": close,
                                       "volume": np.round(volume), "tic": tic}))
@@ -143,8 +151,9 @@ class PanelGenerator:
     def scenario(self, tickers, start_idx, market="model", seed=None):
         dates = self.P.dates[start_idx:start_idx + self.L]
         mpath = self.market_path(market, start_idx, seed)
-        tpaths = self.ticker_paths(mpath, tickers, seed)
-        return self.to_ohlcv(tpaths, mpath, tickers, dates, max(start_idx - 1, 0))
+        stats = self.stats_for(tickers, start_idx)
+        tpaths = self.ticker_paths(mpath, tickers, stats, seed)
+        return self.to_ohlcv(tpaths, mpath, tickers, dates, max(start_idx - 1, 0), stats)
 
 
 def main():
@@ -174,7 +183,7 @@ def main():
     P = PanelData(args.ohlcv, args.vix, end_date=args.end_date)
     thr = None
     if not args.no_filter:
-        c = P.c_ret[1:]
+        c = P.ret[1:]
         thr_list = []
         for j in range(c.shape[1]):
             x = c[:, j][np.isfinite(c[:, j])]

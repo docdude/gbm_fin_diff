@@ -3,8 +3,8 @@
 
 Two models:
   --model market   unconditional: [market log-price, log VIX]           (K=2)
-  --model ticker   [log-price, log-range, rel. log-volume | market, VIX]  (K=5,
-                   last two channels observed)
+  --model ticker   [log-price, log-range, rel. log-volume | market, VIX, beta, corr]
+                   (K=7, last four channels observed)
 
 Examples (single GPU):
     python -m gbm_financial.train_panel --model ticker --precond edm --save_dir save/panel/ticker_edm
@@ -26,7 +26,7 @@ from torch.utils.data import DataLoader
 
 from .compare import compare_returns
 from .data import FinancialTimeSeriesDataset, ticker_split
-from .panel_data import PanelData, TICKER_CHANNELS, MARKET_CHANNELS
+from .panel_data import PanelData, TICKER_CHANNELS, MARKET_CHANNELS, STATE_CHANNELS
 from .panel_model import PanelDiffusion
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -52,8 +52,8 @@ def build_data(args, config):
     if args.model == "ticker":
         Xtr, _ = P.ticker_windows(train_t, L=L, stride=args.stride)
         Xva, _ = P.ticker_windows(val_t, L=L, stride=args.stride)
-        names = list(TICKER_CHANNELS) + list(MARKET_CHANNELS)
-        config.update(n_channels=5, conditional=True, cond_channels=[3, 4], anchor_channels=[0, 3])
+        names = list(TICKER_CHANNELS) + list(MARKET_CHANNELS) + list(STATE_CHANNELS)
+        config.update(n_channels=7, conditional=True, cond_channels=[3, 4, 5, 6], anchor_channels=[0, 3])
     else:
         X, meta = P.market_windows(L=L, stride=args.stride, n_baskets=args.n_baskets, seed=config["seed"])
         # time-based hold-out for the single market series: last 10% of window starts
