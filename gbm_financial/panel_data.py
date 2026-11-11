@@ -157,8 +157,10 @@ class PanelData:
         return X, meta
 
     def market_windows(self, L=512, stride=16, n_baskets=1, basket_min=20, seed=0):
-        """(N, 2, L) market windows; n_baskets>1 adds random equal-weight baskets
-        (each rescaled to the market's daily scale) as data augmentation."""
+        """(N, 2, L) market windows; n_baskets>1 adds random equal-weight baskets as
+        data augmentation. Each basket is scaled by ONE factor computed over its
+        full history (not per window), so calm/crisis regimes and the coupling of
+        realised volatility to VIX are preserved."""
         rng = np.random.default_rng(seed)
         T, N = self.ret.shape
         out, meta = [], []
@@ -173,10 +175,13 @@ class PanelData:
                     break
                 k = rng.integers(basket_min, len(avail) + 1)
                 pick = rng.choice(avail, k, replace=False)
-                br = self.ret[s:s + L, pick].mean(axis=1)
-                br = br / np.nanstd(br[1:]) * SCALE
-                out.append(self.market_window(s, L, mret_scaled=np.r_[np.zeros(s), br,
-                                                                       np.zeros(T - s - L)]))
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    full = np.nanmean(self.ret[:, pick], axis=1)
+                scale = SCALE / np.nanstd(full[1:])
+                br = np.r_[np.zeros(s), self.ret[s:s + L, pick].mean(axis=1) * scale,
+                           np.zeros(T - s - L)]
+                out.append(self.market_window(s, L, mret_scaled=br))
                 meta.append((f"basket{b}", self.dates[s]))
         return np.asarray(out, dtype=np.float32), meta
 
