@@ -132,7 +132,8 @@ python -m gbm_financial.train_panel --model market --save_dir save/panel/market_
 # 3. scenarios: 512-day panels for all 99 tickers on real trading calendars
 python -m gbm_financial.panel_assembly --n_scenarios 50 --out save/panel/scenarios \
     --ticker_dir save/panel/ticker_edm --ticker_fine save/panel/ticker_eps/best_model.pth \
-    --market_dir save/panel/market_edm --market_fine save/panel/market_eps/best_model.pth
+    --market_dir save/panel/market_edm --market_fine save/panel/market_eps/best_model.pth \
+    --ticker_fine_sigma 0.3 --market_fine_sigma 0.3
 python -m gbm_financial.panel_eval --scenarios save/panel/scenarios      # vs real panels
 # 4. env configs via the env's own indicator/volatility/ADV/T-bill pipeline (FinRL-Meta venv)
 ~/FinRL-Meta/.venv/bin/python scripts/export_finrl_meta_env.py --scenarios save/panel/scenarios

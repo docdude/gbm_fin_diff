@@ -156,6 +156,10 @@ def main():
     ap.add_argument("--ticker_fine", default=None)
     ap.add_argument("--market_dir", default=None)
     ap.add_argument("--market_fine", default=None)
+    ap.add_argument("--ticker_fine_sigma", type=float, default=0.3,
+                    help="σ below which the ε ticker model takes over (best in eval: 0.3)")
+    ap.add_argument("--market_fine_sigma", type=float, default=0.3)
+    ap.add_argument("--switch", type=float, default=0.5, help="Heun→SDE switch σ (hybrid sampler)")
     ap.add_argument("--market", choices=["model", "real"], default="model")
     ap.add_argument("--calendar_start", default="2010-03-30",
                     help="scenario calendars are drawn from real train dates ≥ this (FRED T-bill coverage)")
@@ -179,8 +183,10 @@ def main():
                 w = w - w.mean()
                 thr_list.append((w[1:] * w[:-1]).mean() / max(w.var(), 1e-20))
         thr = float(np.percentile(thr_list, 0.1))
-    tm = load_model(args.ticker_dir, args.ticker_fine, reject_ac1_below=thr)
-    mm = load_model(args.market_dir, args.market_fine) if args.market == "model" else None
+    tm = load_model(args.ticker_dir, args.ticker_fine, switch=args.switch,
+                    fine_sigma=args.ticker_fine_sigma, reject_ac1_below=thr)
+    mm = (load_model(args.market_dir, args.market_fine, switch=args.switch,
+                     fine_sigma=args.market_fine_sigma) if args.market == "model" else None)
     gen = PanelGenerator(P, tm, mm, seed=args.seed)
     tickers = args.tickers.split(",") if args.tickers else list(P.tickers)
     cal_ok = np.where(P.dates >= args.calendar_start)[0]
