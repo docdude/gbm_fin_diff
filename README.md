@@ -145,6 +145,11 @@ Sampling-time corrections in `panel_assembly` (all default on, target era 2010-0
 Raw model outputs are saved per scenario (`scenario_XXX_raw.npz`). `--from_raw DIR`
 re-applies the ticker-side calibration on CPU in minutes, with no sampling.
 
+**Leakage:** if the DRL side selects on a validation tail inside the generator's training
+range (FinRL-Meta `optuna_vec_mace_v2` carves 2022-04-14 → 2024-05-31), build the bank with
+generators that stop before it: `CUTOFF=2022-04-13 GPUS="0 1" scripts/build_cutoff_bank.sh`
+(trains the 4 models with `--end_date`, then scenarios, eval and env export).
+
 20-scenario bank vs 40 real 2010+ panels (`panel_eval`): pair corr .349 / .355,
 PC1 share .371 / .378, beta dispersion .352 / .325, pooled kurtosis 9.6 / 8.9,
 market vol .0127 / .0124. Turbulence is still high (median 108 / 78), partly from a few
