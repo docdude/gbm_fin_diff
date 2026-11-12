@@ -628,6 +628,46 @@ def test_panel_model(verbose=True, n_epochs=3):
     return ok
 
 
+def test_tail_calibration(verbose=True):
+    """Test 9: filtered tail calibration keeps betas and shock ranks, and maps the
+    de-volatilised residual shocks onto the reference (fat-tailed) distribution."""
+    from scipy import stats as sst
+    from gbm_financial.panel_assembly import TailCalibrator, decompose, devol
+
+    print("\n" + "=" * 60)
+    print("TEST 9: Filtered Tail Calibration")
+    print("=" * 60)
+    rng = np.random.default_rng(0)
+    n, L = 99, 512
+    tc = TailCalibrator.__new__(TailCalibrator)
+    ref = rng.standard_t(3, 400_000)
+    tc.ref_t = np.sort(ref / ref.std())
+    tc.ref_m = tc.ref_t
+    tc.k_range, tc.k_vol, tc.market_ref = 0.007, 0.007, None
+    dm = rng.standard_normal(L - 1) * 0.017
+    market = np.stack([np.r_[0.0, np.cumsum(dm)], np.zeros(L)])
+    b = rng.uniform(0.5, 1.8, n)
+    dc = b[:, None] * dm + rng.standard_normal((n, L - 1)) * 0.012
+    paths = np.zeros((n, 3, L))
+    paths[:, 0, 1:] = np.cumsum(dc, 1)
+    out = tc.tickers(paths, market)
+    mu0, b0, e0 = decompose(dc, dm)
+    dco = np.diff(out[:, 0], axis=1)
+    _, b1, _ = decompose(dco, dm)
+    u0, sig = devol(e0)
+    u1 = (dco - mu0 - b0[:, None] * (dm - dm.mean())) / sig
+    beta_ok = np.abs(b1 - b0).max() < 0.1 and np.corrcoef(b0, b1)[0, 1] > 0.99
+    rank_ok = sst.spearmanr(u0.ravel(), u1.ravel())[0] > 0.9999
+    k_ref, k_out = sst.kurtosis(tc.ref_t), sst.kurtosis(u1.ravel())
+    tail_ok = abs(np.log(k_out / k_ref)) < np.log(1.5) and sst.kurtosis(u0.ravel()) < 1.0
+    ok = bool(beta_ok and rank_ok and tail_ok)
+    if verbose:
+        print(f"  beta kept: {beta_ok} (max |Δβ| {np.abs(b1 - b0).max():.3f})  ranks kept: {rank_ok}  "
+              f"shock kurtosis {sst.kurtosis(u0.ravel()):.2f} → {k_out:.2f} (ref {k_ref:.2f})")
+        print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "#" * 60)
@@ -693,6 +733,13 @@ def run_all_tests():
     except Exception as e:
         results["panel_model"] = ("ERROR", str(e))
 
+    # Test 9: tail calibration
+    try:
+        passed = test_tail_calibration()
+        results["tail_calib"] = ("PASS" if passed else "FAIL", "")
+    except Exception as e:
+        results["tail_calib"] = ("ERROR", str(e))
+
     # Summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
@@ -718,7 +765,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=str, default="all",
                         choices=["all", "oracle", "shapes", "train", "noise", "gen",
-                                 "samplers", "edm", "panel", "quick"])
+                                 "samplers", "edm", "panel", "tails", "quick"])
     args = parser.parse_args()
 
     if args.test == "all":
@@ -739,6 +786,8 @@ if __name__ == "__main__":
         test_edm_precond()
     elif args.test == "panel":
         test_panel_model()
+    elif args.test == "tails":
+        test_tail_calibration()
     elif args.test == "quick":
         # Quick: just oracle + shapes (fast, no training)
         test_sde_oracle()

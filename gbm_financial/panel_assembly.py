@@ -20,6 +20,7 @@ CLI:
 """
 
 import argparse
+import glob
 import json
 import os
 
@@ -76,23 +77,251 @@ class EmpiricalOHLC:
         return a, g
 
 
+def market_path_features(X, mstats):
+    """Regime features of market windows X (n, 2, L) [market log-price, log VIX]."""
+    r = np.diff(X[:, 0], axis=1) / SCALE * mstats["mret_std"]
+    lvix = X[:, 1] / SCALE * mstats["lvix_dstd"] + mstats["lvix_mean"]
+    rc = r - r.mean(1, keepdims=True)
+    sd = rc.std(1)
+    a = np.abs(r) - np.abs(r).mean(1, keepdims=True)
+    acf_abs = np.mean([(a[:, :-k] * a[:, k:]).mean(1) / (a ** 2).mean(1) for k in range(1, 11)], axis=0)
+    cum = np.cumsum(r, axis=1)
+    mdd = (cum - np.maximum.accumulate(cum, axis=1)).min(1)
+    kurt = (rc ** 4).mean(1) / sd ** 4 - 3
+    skew = (rc ** 3).mean(1) / sd ** 3
+    return np.column_stack([np.log(sd), np.arcsinh(kurt), skew, acf_abs, lvix.mean(1), lvix.std(1),
+                            mdd, np.log(np.exp(lvix).mean(1) / (sd * np.sqrt(252) * 100))])
+
+
+class EraSelector:
+    """Rejection sampler restricting generated market paths to a target era.
+
+    The market model learns the full-history regime mixture (e.g. dot-com era:
+    high vol, high beta dispersion, low correlation). A logistic classifier on
+    regime features of REAL windows, labelled by start date ≥ era_start, gives
+    p(era | x); since the model's paths approximate the full-history mixture,
+    accepting a path with probability p(era | x) yields the target era's
+    regime distribution (density ratio q_era/q_all = p(era | x) / π_era).
+
+    Only regime-level features (log vol, VIX level and variability) are used:
+    tail-shape features (kurtosis, |r| clustering) differ by era too, but the model
+    under-produces them in every era, so selecting on them over-selects calm paths."""
+
+    FEATURES = [0, 4, 5]
+
+    def __init__(self, P, L, era_start, stride=8):
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        starts = [s for s in range(0, len(P.dates) - L + 1, stride)
+                  if np.isfinite(P.m_vix[s:s + L]).all()]
+        X = np.stack([P.market_window(s, L) for s in starts])
+        y = P.dates[starts] >= era_start
+        self.mstats = P.mstats
+        self.clf = make_pipeline(StandardScaler(), LogisticRegression(C=0.1, max_iter=1000))
+        self.clf.fit(market_path_features(X, P.mstats)[:, self.FEATURES], y)
+        self.prior = float(y.mean())
+
+    def accept_prob(self, X):
+        return self.clf.predict_proba(market_path_features(X, self.mstats)[:, self.FEATURES])[:, 1]
+
+
+EWMA_LAMBDA = 0.94
+
+
+class CalendarMatcher:
+    """Choose a real calendar start whose market state matches a generated market path.
+
+    Ticker channels are generated in units of each ticker's trailing vol at the
+    calendar start, and the ticker model learned them alongside real market paths
+    that start from that state. Pairing a calm path with a turbulent date (or vice
+    versa) makes tickers move 0.4-2x the market, so the start is drawn from the k
+    real dates nearest in (start log VIX, log vol of first 63 days, log vol of window)."""
+
+    def __init__(self, P, L, cal_starts, k=5):
+        self.mstats, self.k = P.mstats, k
+        self.starts = np.asarray(cal_starts)
+        F = self._features(np.stack([P.market_window(s, L) for s in self.starts]))
+        self.mu, self.sd = F.mean(0), F.std(0)
+        self.F = (F - self.mu) / self.sd
+
+    def _features(self, X):
+        r = np.diff(X[:, 0], axis=1) / SCALE * self.mstats["mret_std"]
+        lvix0 = X[:, 1, :5].mean(1) / SCALE * self.mstats["lvix_dstd"]
+        return np.column_stack([lvix0, np.log(r[:, :63].std(1)), np.log(r.std(1))])
+
+    def match(self, path, rng):
+        f = (self._features(path[None])[0] - self.mu) / self.sd
+        d = ((self.F - f) ** 2).sum(1)
+        return int(self.starts[rng.choice(np.argsort(d)[:self.k])])
+
+
+def devol(x, lam=EWMA_LAMBDA):
+    """Causal EWMA de-volatilisation of zero-mean shocks x (n, T) → (u, sig)."""
+    v = np.empty_like(x)
+    prev = (x ** 2).mean(-1)
+    for t in range(x.shape[-1]):
+        v[:, t] = prev
+        prev = lam * prev + (1 - lam) * x[:, t] ** 2
+    sig = np.sqrt(np.maximum(v, 1e-20))
+    return x / sig, sig
+
+
+def decompose(dc, dm):
+    """dc (n, T) ticker increments, dm (T,) market increments → mean, beta, residual."""
+    dmc = dm - dm.mean()
+    mu = dc.mean(1, keepdims=True)
+    b = (dc - mu) @ dmc / (dmc ** 2).sum()
+    return mu, b, dc - mu - b[:, None] * dmc
+
+
+def quantile_map(u, ref_sorted):
+    """Map u to ref's distribution through u's own pooled empirical CDF."""
+    flat = u.ravel()
+    q = (np.argsort(np.argsort(flat)) + 0.5) / flat.size
+    grid = (np.arange(ref_sorted.size) + 0.5) / ref_sorted.size
+    return np.interp(q, grid, ref_sorted).reshape(u.shape)
+
+
+class TailCalibrator:
+    """Filtered quantile mapping of generated shocks onto real (target-era) shocks.
+
+    Diffusion samples under-produce rare large moves (≈½ the real rate of >6σ days).
+    Returns are split into mean + beta·market + residual, the residual (or the
+    market return itself) is de-volatilised with a causal EWMA, and the shocks u are
+    quantile-mapped to the pooled real distribution of the same statistic computed
+    with the identical pipeline. Timing, volatility clustering, betas and
+    correlations are kept; only the conditional tail shape changes. Log-range and
+    log-volume channels move with |u| using slopes fitted on real data."""
+
+    def __init__(self, P, L, era_start, stride=128, corr_shrink=0.1):
+        T = len(P.dates)
+        e0 = int(np.searchsorted(P.dates, era_start))
+        starts = [s for s in range(e0, T - L + 1, stride)
+                  if np.isfinite(P.m_vix[s:s + L]).all()]
+        um, ut, du_lr, du_lv = [], [], [], []
+        N = len(P.tickers)
+        S, n_pair = np.zeros((N, N)), np.zeros((N, N))
+        for s in starts:
+            dm = np.diff(P.market_window(s, L)[0])
+            um.append(devol((dm - dm.mean())[None])[0][0])
+            U = np.zeros((N, L - 1))
+            ok = np.zeros(N, dtype=bool)
+            for j in range(N):
+                if not P.ticker_valid(j)[s + 1:s + L].all() or not (P.volume[s:s + L, j] > 0).all():
+                    continue
+                st = P.window_stats(j, s, fallback=False)
+                if st is None:
+                    continue
+                c = P.ticker_channels(j, s, L, st)
+                if not np.isfinite(c).all():
+                    continue
+                u = devol(decompose(np.diff(c[0])[None], dm)[2])[0][0]
+                ut.append(u)
+                du_lr.append(np.c_[np.abs(u), c[1, 1:]])
+                du_lv.append(np.c_[np.abs(u), c[2, 1:]])
+                U[j], ok[j] = u, True
+            if (s - e0) % (L - 1) < stride:      # ~non-overlapping windows for the correlation
+                S += U @ U.T
+                n_pair += np.outer(ok, ok) * (L - 1)
+        self.ref_m = np.sort(np.concatenate(um))
+        self.ref_t = np.sort(np.concatenate(ut))
+        self.k_range = self._slope(np.concatenate(du_lr))
+        self.k_vol = self._slope(np.concatenate(du_lv))
+        self.market_ref = None
+        self.res_corr = self._corr(S, n_pair, corr_shrink)
+
+    @staticmethod
+    def _corr(S, n, shrink):
+        """Residual-shock correlation of real tickers (sector structure), shrunk to I."""
+        with np.errstate(invalid="ignore", divide="ignore"):
+            cov = np.where(n > 0, S / n, 0.0)
+            d = np.sqrt(np.diag(cov))
+            C = np.where(np.outer(d, d) > 0, cov / np.outer(d, d), 0.0)
+        C = (1 - shrink) * C + shrink * np.eye(len(C))
+        w, V = np.linalg.eigh(C)
+        C = (V * np.maximum(w, 1e-3)) @ V.T
+        d = np.sqrt(np.diag(C))
+        return C / np.outer(d, d)
+
+    @staticmethod
+    def _slope(a):
+        x = a[:, 0] - a[:, 0].mean()
+        return float((x * (a[:, 1] - a[:, 1].mean())).sum() / (x ** 2).sum())
+
+    def fit_market_bank(self, bank):
+        """Pooled generated market shocks (CDF source for market mapping)."""
+        dm = np.diff(bank[:, 0], axis=1)
+        self.market_ref = devol(dm - dm.mean(1, keepdims=True))[0]
+
+    def market(self, path):
+        dm = np.diff(path[0])
+        mu = dm.mean()
+        u, sig = devol((dm - mu)[None])
+        pool = np.concatenate([u, self.market_ref]) if self.market_ref is not None else u
+        u2 = quantile_map(pool, self.ref_m)[:1]
+        out = path.copy()
+        out[0] = path[0, 0] + np.r_[0.0, np.cumsum(mu + u2[0] * sig[0])]
+        return out
+
+    def tickers(self, paths, market, idx=None):
+        """paths (n, 3, L) generated [c0, c1, c2]; market (2, L) conditioning path;
+        idx: indices of the n tickers in P.tickers (enables residual correlation)."""
+        dc = np.diff(paths[:, 0], axis=1)
+        dm = np.diff(market[0])
+        mu, b, e = decompose(dc, dm)
+        u, sig = devol(e)
+        if idx is not None and getattr(self, "res_corr", None) is not None:
+            # Gaussian copula: mix normal scores so sector peers co-move without
+            # copying each other's idiosyncratic jumps; tails restored by the map below
+            from scipy.stats import norm
+            flat = u.ravel()
+            z = norm.ppf((np.argsort(np.argsort(flat)) + 0.5) / flat.size).reshape(u.shape)
+            w, V = np.linalg.eigh(self.res_corr[np.ix_(idx, idx)])
+            u_mixed = (V * np.sqrt(np.maximum(w, 0))) @ V.T @ z
+        else:
+            u_mixed = u
+        u2 = quantile_map(u_mixed, self.ref_t)
+        out = paths.copy()
+        out[:, 0, 1:] = paths[:, 0, :1] + np.cumsum(mu + b[:, None] * (dm - dm.mean()) + u2 * sig, axis=1)
+        d = np.abs(u2) - np.abs(u)
+        out[:, 1, 1:] += self.k_range * d
+        out[:, 2, 1:] += self.k_vol * d
+        return out
+
+
 class PanelGenerator:
 
-    def __init__(self, P, ticker_model, market_model=None, seed=0):
+    def __init__(self, P, ticker_model, market_model=None, seed=0, era=None, tails=None, seq_len=None):
         self.P = P
         self.tm = ticker_model
         self.mm = market_model
-        self.L = int(ticker_model.config["seq_len"])
+        self.L = int(ticker_model.config["seq_len"] if ticker_model is not None else seq_len)
         self.emp = EmpiricalOHLC(P)
         self.rng = np.random.default_rng(seed)
+        self.era = era
+        self.tails = tails
+        self.market_identity = True
+        self.last_market_accept = None
 
     # -- market -------------------------------------------------------------
-    def market_path(self, mode="model", start_idx=None, seed=None):
+    def market_path(self, mode="model", start_idx=None, seed=None, batch=8, max_rounds=50):
         if mode == "real":
             return self.P.market_window(start_idx, self.L)
         if self.mm is None:
             raise ValueError("market='model' needs a market model")
-        return self.mm.sample_panel(1, self.L, cond=None, seed=seed)[0]
+        if self.era is None:
+            return self.mm.sample_panel(1, self.L, cond=None, seed=seed)[0]
+        rng = np.random.default_rng(seed)
+        for k in range(max_rounds):
+            G = self.mm.sample_panel(batch, self.L, cond=None,
+                                     seed=None if seed is None else seed + 104729 * k)
+            p = self.era.accept_prob(G)
+            ok = np.where(rng.random(batch) < p)[0]
+            if len(ok):
+                self.last_market_accept = float(p[ok[0]])
+                return G[ok[0]]
+        raise RuntimeError("era selection accepted no market path")
 
     # -- tickers ------------------------------------------------------------
     def ticker_paths(self, market, tickers, stats, seed=None):
@@ -114,6 +343,18 @@ class PanelGenerator:
 
     def stats_for(self, tickers, s):
         return [self.P.window_stats(self.P.tickers.index(t), s) for t in tickers]
+
+    def enforce_market_identity(self, paths, market, stats):
+        """The market channel IS the equal-weight mean of these tickers' returns, so
+        shift every ticker's daily return by (market − EW of generated tickers).
+        A common shift: dispersion and residual structure are unchanged."""
+        vol = np.array([st["vol"] for st in stats])[:, None]
+        r = np.diff(paths[:, 0], axis=1) / SCALE * vol
+        m = np.diff(market[0]) / SCALE * self.P.mstats["mret_std"]
+        r = r + (m - r.mean(0))[None]
+        out = paths.copy()
+        out[:, 0, 1:] = paths[:, 0, :1] + np.cumsum(r / vol * SCALE, axis=1)
+        return out
 
     def to_ohlcv(self, paths, market, tickers, dates, ref_idx, stats=None):
         """Invert channels to OHLCV. stats: per-ticker window_stats at the window
@@ -148,12 +389,58 @@ class PanelGenerator:
                            "vix": np.exp(market[1] / SCALE * P.mstats["lvix_dstd"] + P.mstats["lvix_mean"])})
         return df.sort_values(["date", "tic"]).reset_index(drop=True), mk
 
-    def scenario(self, tickers, start_idx, market="model", seed=None):
+    def scenario(self, tickers, start_idx, market="model", seed=None, mpath=None):
+        """One scenario; mpath: pre-generated (2, L) market path (overrides ``market``)."""
         dates = self.P.dates[start_idx:start_idx + self.L]
-        mpath = self.market_path(market, start_idx, seed)
+        if mpath is None:
+            mpath = self.market_path(market, start_idx, seed)
+        mraw = mpath
+        if self.tails is not None and market == "model":
+            mpath = self.tails.market(mpath)
         stats = self.stats_for(tickers, start_idx)
         tpaths = self.ticker_paths(mpath, tickers, stats, seed)
+        self.last_raw = {"market_raw": mraw, "market": mpath, "tickers_raw": tpaths}
+        if self.tails is not None:
+            tpaths = self.tails.tickers(tpaths, mpath, [self.P.tickers.index(t) for t in tickers])
+        if self.market_identity:
+            tpaths = self.enforce_market_identity(tpaths, mpath, stats)
         return self.to_ohlcv(tpaths, mpath, tickers, dates, max(start_idx - 1, 0), stats)
+
+
+def reassemble(args, P):
+    """Rebuild scenarios from saved raw model outputs (``scenario_*_raw.npz``) with the
+    current ticker-side calibration; no sampling. Tickers stay conditioned on the
+    saved (already calibrated) market path."""
+    files = sorted(glob.glob(os.path.join(args.from_raw, "scenario_*_raw.npz")))
+    if not files:
+        raise FileNotFoundError(f"no scenario_*_raw.npz in {args.from_raw}")
+    L = int(np.load(files[0])["market"].shape[-1])
+    gen = PanelGenerator(P, None, seed=args.seed, seq_len=L)
+    if args.tail_era.lower() != "none":
+        gen.tails = TailCalibrator(P, L, args.tail_era)
+        if args.no_sector_corr:
+            gen.tails.res_corr = None
+    os.makedirs(args.out, exist_ok=True)
+    manifest = []
+    for k, f in enumerate(files):
+        z = np.load(f)
+        s, tickers, mpath, tp = int(z["start_idx"]), list(z["tickers"]), z["market"], z["tickers_raw"]
+        if gen.tails is not None:
+            tp = gen.tails.tickers(tp, mpath, [P.tickers.index(t) for t in tickers])
+        stats = gen.stats_for(tickers, s)
+        if not args.no_market_identity:
+            tp = gen.enforce_market_identity(tp, mpath, stats)
+        df, mk = gen.to_ohlcv(tp, mpath, tickers, P.dates[s:s + L], max(s - 1, 0), stats)
+        out = os.path.join(args.out, f"scenario_{k:03d}.csv.gz")
+        df.to_csv(out, index=False)
+        mk.to_csv(os.path.join(args.out, f"scenario_{k:03d}_market.csv"), index=False)
+        np.savez_compressed(os.path.join(args.out, f"scenario_{k:03d}_raw.npz"),
+                            **{key: z[key] for key in z.files})
+        manifest.append({"file": os.path.basename(out), "source": f, "calendar_start": str(P.dates[s]),
+                         "calendar_end": str(P.dates[s + L - 1])})
+        print(f"[{k + 1}/{len(files)}] {out}", flush=True)
+    with open(os.path.join(args.out, "manifest.json"), "w") as fh:
+        json.dump({"args": vars(args), "scenarios": manifest}, fh, indent=2)
 
 
 def main():
@@ -161,17 +448,32 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out", required=True)
     ap.add_argument("--n_scenarios", type=int, default=10)
-    ap.add_argument("--ticker_dir", required=True)
+    ap.add_argument("--ticker_dir", default=None, help="required unless --from_raw")
     ap.add_argument("--ticker_fine", default=None)
     ap.add_argument("--market_dir", default=None)
     ap.add_argument("--market_fine", default=None)
-    ap.add_argument("--ticker_fine_sigma", type=float, default=0.3,
-                    help="σ below which the ε ticker model takes over (best in eval: 0.3)")
-    ap.add_argument("--market_fine_sigma", type=float, default=0.3)
+    ap.add_argument("--ticker_fine_sigma", type=float, default=0.1,
+                    help="σ below which the ε ticker model takes over (0.1: vol ratio 1.00 on real markets)")
+    ap.add_argument("--market_fine_sigma", type=float, default=0.03,
+                    help="0.03: best |r| clustering / kurtosis in the market sampler sweep")
     ap.add_argument("--switch", type=float, default=0.5, help="Heun→SDE switch σ (hybrid sampler)")
     ap.add_argument("--market", choices=["model", "real"], default="model")
+    ap.add_argument("--market_era", default="2010-03-30",
+                    help="keep generated market paths whose regime matches real windows starting on/after "
+                         "this date (rejection sampling); 'none' = full 1995+ regime mixture")
+    ap.add_argument("--tail_era", default="2010-03-30",
+                    help="filtered tail calibration of market/ticker shocks to real windows starting "
+                         "on/after this date; 'none' disables")
     ap.add_argument("--calendar_start", default="2010-03-30",
                     help="scenario calendars are drawn from real train dates ≥ this (FRED T-bill coverage)")
+    ap.add_argument("--random_calendar", action="store_true",
+                    help="draw calendar starts at random instead of matching each market path's state")
+    ap.add_argument("--no_sector_corr", action="store_true",
+                    help="skip injecting the real residual (sector) correlation into ticker shocks")
+    ap.add_argument("--no_market_identity", action="store_true",
+                    help="skip forcing the tickers' equal-weight return to equal the market path")
+    ap.add_argument("--from_raw", default=None,
+                    help="re-assemble scenarios from DIR/scenario_*_raw.npz (no sampling, no models)")
     ap.add_argument("--tickers", default=None, help="comma list; default: all 99 env tickers")
     ap.add_argument("--ohlcv", default=os.path.join(ROOT, "data/nas100/tiingo_ohlcv.csv.gz"))
     ap.add_argument("--vix", default=os.path.join(ROOT, "data/nas100/vix.csv"))
@@ -181,6 +483,10 @@ def main():
     args = ap.parse_args()
 
     P = PanelData(args.ohlcv, args.vix, end_date=args.end_date)
+    if args.from_raw:
+        return reassemble(args, P)
+    if not args.ticker_dir:
+        ap.error("--ticker_dir is required unless --from_raw is given")
     thr = None
     if not args.no_filter:
         c = P.ret[1:]
@@ -196,21 +502,49 @@ def main():
                     fine_sigma=args.ticker_fine_sigma, reject_ac1_below=thr)
     mm = (load_model(args.market_dir, args.market_fine, switch=args.switch,
                      fine_sigma=args.market_fine_sigma) if args.market == "model" else None)
-    gen = PanelGenerator(P, tm, mm, seed=args.seed)
+    era = None
+    if args.market == "model" and args.market_era.lower() != "none":
+        era = EraSelector(P, tm.config["seq_len"], args.market_era)
+        print(f"market era selection: windows ≥ {args.market_era} (prior {era.prior:.2f})", flush=True)
+    gen = PanelGenerator(P, tm, mm, seed=args.seed, era=era)
+    gen.market_identity = not args.no_market_identity
+    if args.tail_era.lower() != "none":
+        gen.tails = TailCalibrator(P, gen.L, args.tail_era)
+        if args.no_sector_corr:
+            gen.tails.res_corr = None
+        print(f"tail calibration: real shocks ≥ {args.tail_era} "
+              f"(k_range {gen.tails.k_range:.3f}, k_vol {gen.tails.k_vol:.3f})", flush=True)
     tickers = args.tickers.split(",") if args.tickers else list(P.tickers)
     cal_ok = np.where(P.dates >= args.calendar_start)[0]
-    starts = np.random.default_rng(args.seed).choice(
-        cal_ok[cal_ok <= len(P.dates) - gen.L], args.n_scenarios, replace=False)
+    cal_ok = cal_ok[cal_ok <= len(P.dates) - gen.L]
+    starts = sorted(np.random.default_rng(args.seed).choice(cal_ok, args.n_scenarios, replace=False))
+    bank, bank_p = None, []
+    if args.market == "model":
+        paths = []
+        for k in range(args.n_scenarios):
+            paths.append(gen.market_path("model", seed=args.seed + 7919 * k))
+            bank_p.append(gen.last_market_accept)
+        bank = np.stack(paths)
+        if gen.tails is not None:
+            gen.tails.fit_market_bank(bank)
+        if not args.random_calendar:
+            cm = CalendarMatcher(P, gen.L, cal_ok)
+            crng = np.random.default_rng(args.seed + 1)
+            starts = [cm.match(p, crng) for p in bank]
     os.makedirs(args.out, exist_ok=True)
     manifest = []
-    for k, s in enumerate(sorted(starts)):
-        df, mk = gen.scenario(tickers, int(s), market=args.market, seed=args.seed + 7919 * k)
+    for k, s in enumerate(starts):
+        df, mk = gen.scenario(tickers, int(s), market=args.market, seed=args.seed + 7919 * k,
+                              mpath=None if bank is None else bank[k])
         f = os.path.join(args.out, f"scenario_{k:03d}.csv.gz")
         df.to_csv(f, index=False)
         mk.to_csv(os.path.join(args.out, f"scenario_{k:03d}_market.csv"), index=False)
+        np.savez_compressed(os.path.join(args.out, f"scenario_{k:03d}_raw.npz"),
+                            start_idx=int(s), tickers=np.array(tickers), **gen.last_raw)
         manifest.append({"file": os.path.basename(f), "calendar_start": str(P.dates[s]),
                          "calendar_end": str(P.dates[s + gen.L - 1]), "market": args.market,
-                         "rejection_rate": getattr(tm, "last_rejection_rate", 0.0)})
+                         "rejection_rate": getattr(tm, "last_rejection_rate", 0.0),
+                         "market_era_prob": bank_p[k] if bank_p else None})
         print(f"[{k + 1}/{args.n_scenarios}] {f}: {df.tic.nunique()} tickers × {df.date.nunique()} days "
               f"({manifest[-1]['calendar_start']} → {manifest[-1]['calendar_end']})", flush=True)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:

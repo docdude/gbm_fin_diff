@@ -113,13 +113,42 @@ spread ×1.3, mean 2048-day drift 0.70 vs 0.95, clustering decay β slightly fas
 Two models generate whole cross-sectional panels:
 
 - **Market model** (unconditional, K=2): equal-weight market log-price + log VIX.
-- **Ticker model** (K=5, last two channels observed): per-ticker anchored log-price,
-  log(high/low) range and log volume relative to its trailing 252-day median,
-  **conditioned on the market path**. Every ticker in a scenario shares one market path,
+- **Ticker model** (K=7, last four channels observed): per-ticker anchored log-price,
+  log(high/low) range and log volume (all normalised by causal trailing 252-day
+  statistics), **conditioned on the market path** plus the ticker's trailing beta and
+  correlation to the market. Every ticker in a scenario shares one market path,
   which is what produces realistic cross-asset correlation.
 
 All channels are scaled per ticker so day-to-day changes have std 0.017. Training data
 is Tiingo 1995 → 2024-05-31, which ends on the env's last training day, so no trade-period leakage.
+
+Sampling-time corrections in `panel_assembly` (all default on, target era 2010-03-30+):
+
+- **Era-matched market paths** (`--market_era`): the market model learns the full
+  1995+ regime mix. Dot-com-style markets drive high beta dispersion and low correlation in
+  the ticker model, so generated market paths are rejection-sampled with
+  p(era | vol, VIX level, VIX variability) from a classifier fitted on real windows.
+- **State-matched calendars** (`--random_calendar` to disable): ticker channels are in units
+  of each ticker's trailing vol at the calendar start. Each scenario's start date is drawn
+  from the 5 real dates whose market state (start VIX, early and full-window vol) is nearest
+  to the generated path. A random date made tickers move 0.4–2× the market.
+- **Filtered tail calibration** (`--tail_era`): the diffusion models produce about half
+  the real rate of >6σ days. De-volatilised (EWMA) market shocks and ticker residual
+  shocks are quantile-mapped onto the real target-era distribution, which keeps timing,
+  vol clustering, betas and correlations intact. Range and volume move with the shock size.
+- **Sector correlation** (`--no_sector_corr` to disable): generated ticker residuals are
+  independent across tickers. Their normal scores are mixed with the real residual
+  correlation matrix (Gaussian copula, shrunk 10% to I) before the tail mapping.
+- **Market identity** (`--no_market_identity` to disable): the market channel is the
+  equal-weight mean of these tickers, so a common daily shift enforces that exactly.
+
+Raw model outputs are saved per scenario (`scenario_XXX_raw.npz`). `--from_raw DIR`
+re-applies the ticker-side calibration on CPU in minutes, with no sampling.
+
+20-scenario bank vs 40 real 2010+ panels (`panel_eval`): pair corr .349 / .355,
+PC1 share .371 / .378, beta dispersion .352 / .325, pooled kurtosis 9.6 / 8.9,
+market vol .0127 / .0124. Turbulence is still high (median 108 / 78), partly from a few
+2008-level stress scenarios.
 
 ```bash
 # 1. data (FinRL-Meta venv, uses its Tiingo processor + repo .env)
@@ -132,8 +161,8 @@ python -m gbm_financial.train_panel --model market --save_dir save/panel/market_
 # 3. scenarios: 512-day panels for all 99 tickers on real trading calendars
 python -m gbm_financial.panel_assembly --n_scenarios 50 --out save/panel/scenarios \
     --ticker_dir save/panel/ticker_edm --ticker_fine save/panel/ticker_eps/best_model.pth \
-    --market_dir save/panel/market_edm --market_fine save/panel/market_eps/best_model.pth \
-    --ticker_fine_sigma 0.3 --market_fine_sigma 0.3
+    --market_dir save/panel/market_edm --market_fine save/panel/market_eps/best_model.pth
+    # defaults: --ticker_fine_sigma 0.1 --market_fine_sigma 0.03 --market_era/--tail_era 2010-03-30
 python -m gbm_financial.panel_eval --scenarios save/panel/scenarios      # vs real panels
 # 4. env configs via the env's own indicator/volatility/ADV/T-bill pipeline (FinRL-Meta venv)
 ~/FinRL-Meta/.venv/bin/python scripts/export_finrl_meta_env.py --scenarios save/panel/scenarios

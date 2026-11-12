@@ -143,12 +143,13 @@ def main():
                 P.ret[idx][:, J], np.log(P.high[idx][:, J] / P.low[idx][:, J]),
                 np.log(np.maximum(P.volume[idx][:, J], 1.0)), inv_cov))
     out = {k: summarize(v) for k, v in res.items()}
+    out["per_scenario"] = {os.path.basename(f): r for f, r in zip(files, res["synthetic"])}
     with open(os.path.join(args.scenarios, "panel_eval.json"), "w") as fh:
         json.dump(out, fh, indent=2)
     keys = list(out["real"].keys())
-    print(f"{'metric':<22}" + "".join(f"{k[:20]:>22}" for k in out))
+    print(f"{'metric':<22}" + "".join(f"{k[:20]:>22}" for k in res))
     for m in keys:
-        print(f"{m:<22}" + "".join(f"{out[k][m]['mean']:>14.4g}±{out[k][m]['std']:<7.2g}" for k in out))
+        print(f"{m:<22}" + "".join(f"{out[k][m]['mean']:>14.4g}±{out[k][m]['std']:<7.2g}" for k in res))
     print(f"\n{len(files)} synthetic panels, {args.n_real} real/baseline panels, L={L}, "
           f"{len(tickers)} tickers ({int(okc.sum())} with complete data since {args.real_start})")
 
