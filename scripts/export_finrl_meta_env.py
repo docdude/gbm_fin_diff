@@ -12,7 +12,8 @@ and FRED DTB3 T-bill rates aligned to the dates.
 Writes <scenario>.env.pkl dicts with keys date_list, price_array, tech_array,
 volatility_array, volume_array, adv20_array, tbill_rates, tic_list — the same
 structure as MarketDataPreparator.create_env_config(), so they can be passed to
-MACEVecEnv(config=...) / MACEStockTradingEnv in place of the real train config.
+MACEVecEnv(config=...) / MACEStockTradingEnv in place of the real train config —
+plus ``vix`` (the scenario's VIX path, for an optional VIX state feature).
 
 --check_equivalence rebuilds the env's real TRAIN config through this pipeline
 from the env's cached raw OHLCV and compares it with create_env_config().
@@ -114,6 +115,10 @@ def main():
     for f in files:
         raw = pd.read_csv(f)
         cfg = build_env_config(raw, INDICATORS, cache_dir, fred_key)
+        mk = f.replace(".csv.gz", "_market.csv")
+        if os.path.exists(mk):  # scenario VIX path (optional state feature in the env)
+            v = pd.read_csv(mk).set_index("date")["vix"]
+            cfg["vix"] = v.reindex(np.asarray(cfg["date_list"]).astype(str)).ffill().bfill().to_numpy(np.float32)
         out = f.replace(".csv.gz", ".env.pkl")
         with open(out, "wb") as fh:
             pickle.dump(cfg, fh)

@@ -128,6 +128,55 @@ class EraSelector:
 
 EWMA_LAMBDA = 0.94
 
+# Regime labels on the traded episode (the env drops ~59 indicator warm-up days)
+EPISODE_DAYS = 453
+CRASH_20D, BEAR_ANN, BULL_ANN, STATE_63D = -0.20, -0.10, 0.15, 0.05
+REGIMES = ("bull", "sideways", "bear", "crash")
+
+
+def regime_stats(index, vix=None):
+    """Regime label + summary of a price index path, in order: bear (annualised
+    ≤ −10%), crash (worst 20-day return ≤ −20%, i.e. a sharp drop that does not
+    turn into a bear), bull (annualised ≥ +15%), else sideways. 1995→2022 real
+    NAS-100 windows: bull 45%, sideways 21%, bear 10%, crash 24%."""
+    r = np.diff(np.log(np.asarray(index, float)))
+    n = len(r)
+    c0 = np.r_[0.0, np.cumsum(r)]
+    mdd = float(np.exp((c0 - np.maximum.accumulate(c0)).min()) - 1)
+    w20 = float(np.exp((c0[20:] - c0[:-20]).min()) - 1) if n > 21 else np.nan
+    ann = float(np.exp(c0[-1] * 252 / n) - 1)
+    lab = ("bear" if ann <= BEAR_ANN else "crash" if w20 <= CRASH_20D
+           else "bull" if ann >= BULL_ANN else "sideways")
+    r63 = np.exp(c0[63:] - c0[:-63]) - 1 if n > 63 else np.array([0.0])
+    return {"label": lab, "ann_return": ann, "ann_vol": float(r.std() * np.sqrt(252)),
+            "max_drawdown": mdd, "worst_20d": w20,
+            "vix_mean": float(np.nanmean(vix)) if vix is not None else np.nan,
+            "days_bull": float((r63 > STATE_63D).mean()), "days_bear": float((r63 < -STATE_63D).mean()),
+            "days_sideways": float((np.abs(r63) <= STATE_63D).mean())}
+
+
+def market_regime(path, mstats, episode_days=EPISODE_DAYS):
+    """Regime label of a (2, L) market channel path over its last episode_days."""
+    r = np.diff(path[0, -episode_days:]) / SCALE * mstats["mret_std"]
+    return regime_stats(np.exp(np.r_[0.0, np.cumsum(r)]))["label"]
+
+
+def parse_regime_mix(spec, n):
+    """'balanced' or 'bull=0.4,sideways=0.3,...' → integer quotas summing to n."""
+    if spec == "balanced":
+        w = {k: 1.0 for k in REGIMES}
+    else:
+        w = {k: float(v) for k, v in (kv.split("=") for kv in spec.split(","))}
+        bad = set(w) - set(REGIMES)
+        if bad:
+            raise ValueError(f"unknown regimes {bad}; use {REGIMES}")
+    tot = sum(w.values())
+    raw = {k: n * v / tot for k, v in w.items()}
+    q = {k: int(np.floor(v)) for k, v in raw.items()}
+    for k in sorted(raw, key=lambda k: raw[k] - q[k], reverse=True)[:n - sum(q.values())]:
+        q[k] += 1
+    return q
+
 
 class CalendarMatcher:
     """Choose a real calendar start whose market state matches a generated market path.
@@ -323,6 +372,40 @@ class PanelGenerator:
                 return G[ok[0]]
         raise RuntimeError("era selection accepted no market path")
 
+    def market_bank_by_regime(self, quotas, seed=0, stress=("bear", "crash"),
+                              batch=8, max_candidates=4000):
+        """Sample market paths until each regime quota is filled.
+
+        Paths are labelled on the traded episode (regime_stats rules). Era selection
+        still applies, except for regimes in ``stress`` (bear/crash paths may come from
+        the model's full 1995+ history, since 2010+ windows contain almost none).
+        Returns (paths, labels, era_probs)."""
+        need = {k: v for k, v in quotas.items() if v > 0}
+        got = {k: 0 for k in need}
+        rng = np.random.default_rng(seed + 17)
+        paths, labels, probs, seen = [], [], [], {k: 0 for k in REGIMES}
+        k = 0
+        while any(got[r] < need[r] for r in need):
+            if k * batch >= max_candidates:
+                raise RuntimeError(f"regime quotas not filled after {k * batch} candidates: "
+                                   f"got {got}, need {need}, seen {seen}")
+            G = self.mm.sample_panel(batch, self.L, cond=None, seed=seed + 104729 * k)
+            p = self.era.accept_prob(G) if self.era is not None else np.ones(batch)
+            for g, pi in zip(G, p):
+                lab = market_regime(g, self.P.mstats)
+                seen[lab] += 1
+                if got.get(lab, 0) >= need.get(lab, 0):
+                    continue
+                if lab not in stress and rng.random() >= pi:
+                    continue
+                got[lab] += 1
+                paths.append(g)
+                labels.append(lab)
+                probs.append(float(pi))
+            k += 1
+        print(f"regime bank: {k * batch} candidates, labels seen {seen}, kept {got}", flush=True)
+        return np.stack(paths), labels, probs
+
     # -- tickers ------------------------------------------------------------
     def ticker_paths(self, market, tickers, stats, seed=None):
         n = len(tickers)
@@ -474,6 +557,13 @@ def main():
                     help="skip forcing the tickers' equal-weight return to equal the market path")
     ap.add_argument("--from_raw", default=None,
                     help="re-assemble scenarios from DIR/scenario_*_raw.npz (no sampling, no models)")
+    ap.add_argument("--regime_mix", default=None,
+                    help="'balanced' or e.g. 'bull=0.35,sideways=0.35,bear=0.15,crash=0.15': fill "
+                         "per-regime quotas of market paths (labels on the traded episode)")
+    ap.add_argument("--stress_full_history", action="store_true",
+                    help="with --regime_mix: bear/crash paths bypass the era selection")
+    ap.add_argument("--max_candidates", type=int, default=4000,
+                    help="with --regime_mix: market paths to try before giving up")
     ap.add_argument("--tickers", default=None, help="comma list; default: all 99 env tickers")
     ap.add_argument("--ohlcv", default=os.path.join(ROOT, "data/nas100/tiingo_ohlcv.csv.gz"))
     ap.add_argument("--vix", default=os.path.join(ROOT, "data/nas100/vix.csv"))
@@ -518,13 +608,20 @@ def main():
     cal_ok = np.where(P.dates >= args.calendar_start)[0]
     cal_ok = cal_ok[cal_ok <= len(P.dates) - gen.L]
     starts = sorted(np.random.default_rng(args.seed).choice(cal_ok, args.n_scenarios, replace=False))
-    bank, bank_p = None, []
+    bank, bank_p, bank_lab = None, [], []
     if args.market == "model":
-        paths = []
-        for k in range(args.n_scenarios):
-            paths.append(gen.market_path("model", seed=args.seed + 7919 * k))
-            bank_p.append(gen.last_market_accept)
-        bank = np.stack(paths)
+        if args.regime_mix:
+            quotas = parse_regime_mix(args.regime_mix, args.n_scenarios)
+            stress = ("bear", "crash") if args.stress_full_history else ()
+            bank, bank_lab, bank_p = gen.market_bank_by_regime(
+                quotas, seed=args.seed, stress=stress, max_candidates=args.max_candidates)
+        else:
+            paths = []
+            for k in range(args.n_scenarios):
+                paths.append(gen.market_path("model", seed=args.seed + 7919 * k))
+                bank_p.append(gen.last_market_accept)
+            bank = np.stack(paths)
+            bank_lab = [market_regime(p, P.mstats) for p in bank]
         if gen.tails is not None:
             gen.tails.fit_market_bank(bank)
         if not args.random_calendar:
@@ -544,7 +641,8 @@ def main():
         manifest.append({"file": os.path.basename(f), "calendar_start": str(P.dates[s]),
                          "calendar_end": str(P.dates[s + gen.L - 1]), "market": args.market,
                          "rejection_rate": getattr(tm, "last_rejection_rate", 0.0),
-                         "market_era_prob": bank_p[k] if bank_p else None})
+                         "market_era_prob": bank_p[k] if bank_p else None,
+                         "market_regime": bank_lab[k] if bank_lab else None})
         print(f"[{k + 1}/{args.n_scenarios}] {f}: {df.tic.nunique()} tickers × {df.date.nunique()} days "
               f"({manifest[-1]['calendar_start']} → {manifest[-1]['calendar_end']})", flush=True)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:

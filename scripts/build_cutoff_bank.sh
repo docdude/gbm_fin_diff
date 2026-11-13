@@ -7,8 +7,9 @@
 #
 #   CUTOFF=2022-04-13 GPUS="0 1" setsid nohup scripts/build_cutoff_bank.sh > save/logs/cutoff_bank.log 2>&1 &
 #
-# Steps (≈7 h on two GPUs, ≈14 h on one): train market/ticker EDM + ε models,
-# 2×10 scenarios (all corrections on), panel_eval, FinRL-Meta env export.
+# Steps (≈7 h on two GPUs, ≈14 h on one): train market/ticker EDM + ε models, then
+# scripts/build_banks.sh (regime-stratified train + eval banks, eval, env export;
+# ≈6 h more on two GPUs; sizes/mixes via TRAIN_N, EVAL_N, TRAIN_MIX, EVAL_MIX).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 CUTOFF=${CUTOFF:-2022-04-13}
@@ -35,21 +36,5 @@ else
 fi
 echo "models trained $(date)"
 
-COMMON=(--n_scenarios 10 --end_date "$CUTOFF"
-        --ticker_dir "$OUT/ticker_edm" --ticker_fine "$OUT/ticker_eps/best_model.pth"
-        --market_dir "$OUT/market_edm" --market_fine "$OUT/market_eps/best_model.pth")
-for k in 0 1; do
-  g=${GPUS[$(( k % ${#GPUS[@]} ))]}
-  CUDA_VISIBLE_DEVICES=$g $PY -m gbm_financial.panel_assembly --seed $k --out "$OUT/scenarios_s$k" \
-    "${COMMON[@]}" > "save/logs/cut_${CUTOFF}_scen_s$k.log" 2>&1 &
-  [ ${#GPUS[@]} -ge 2 ] || wait
-done
-wait
-mkdir -p "$OUT/scenarios"; i=0
-for k in 0 1; do for j in $(seq -f "%03g" 0 9); do n=$(printf "%03d" $i)
-  for suf in .csv.gz _market.csv _raw.npz; do cp "$OUT/scenarios_s$k/scenario_$j$suf" "$OUT/scenarios/scenario_$n$suf"; done
-  i=$((i + 1)); done; done
-$PY -m gbm_financial.panel_eval --scenarios "$OUT/scenarios" --end_date "$CUTOFF" > "save/logs/cut_${CUTOFF}_panel_eval.log" 2>&1
-"$FINRL_META/.venv/bin/python" scripts/export_finrl_meta_env.py --scenarios "$OUT/scenarios" \
-  --finrl_meta "$FINRL_META" > "save/logs/cut_${CUTOFF}_export.log" 2>&1
-echo "done $(date): $OUT/scenarios/*.env.pkl"
+MODELS="$OUT" CUTOFF="$CUTOFF" GPUS="${GPUS[*]}" FINRL_META="$FINRL_META" scripts/build_banks.sh
+echo "done $(date): $OUT/bank_train/scenarios, $OUT/bank_eval/scenarios"

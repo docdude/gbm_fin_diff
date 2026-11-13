@@ -7,9 +7,9 @@ from the training data.
 
 Per episode (equal-weight index of the scenario's tickers):
   ann_return, ann_vol, max_drawdown, worst_20d (worst 20-day return), mean VIX
-Label (whole episode):
-  crash     worst_20d <= -15%  (fast drop; may recover, e.g. 2020)
+Label (whole episode, rules in gbm_financial.panel_assembly.regime_stats):
   bear      ann_return <= -10%
+  crash     worst_20d <= -20% and not bear (sharp drop that recovers, e.g. 2020)
   bull      ann_return >= +15%
   sideways  otherwise
 Day shares: rolling 63-day return > +5% bull, < -5% bear, else sideways.
@@ -29,25 +29,7 @@ import pandas as pd
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-CRASH_20D, BEAR_ANN, BULL_ANN, STATE_63D = -0.15, -0.10, 0.15, 0.05
-
-
-def characterize(index, vix=None):
-    r = np.diff(np.log(index))
-    n = len(r)
-    cum = np.cumsum(r)
-    c0 = np.r_[0.0, cum]
-    mdd = float(np.exp((c0 - np.maximum.accumulate(c0)).min()) - 1)
-    w20 = float(np.exp(min(cum[i + 20] - cum[i] for i in range(n - 20))) - 1) if n > 21 else np.nan
-    ann = float(np.exp(cum[-1] * 252 / n) - 1)
-    lab = ("crash" if w20 <= CRASH_20D else "bear" if ann <= BEAR_ANN
-           else "bull" if ann >= BULL_ANN else "sideways")
-    r63 = np.exp(cum[63:] - cum[:-63]) - 1 if n > 63 else np.array([0.0])
-    return {"label": lab, "ann_return": ann, "ann_vol": float(r.std() * np.sqrt(252)),
-            "max_drawdown": mdd, "worst_20d": w20,
-            "vix_mean": float(np.nanmean(vix)) if vix is not None else np.nan,
-            "days_bull": float((r63 > STATE_63D).mean()), "days_bear": float((r63 < -STATE_63D).mean()),
-            "days_sideways": float((np.abs(r63) <= STATE_63D).mean())}
+from gbm_financial.panel_assembly import regime_stats as characterize  # noqa: E402
 
 
 def ew_index(price):
