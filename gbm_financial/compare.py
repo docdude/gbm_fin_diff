@@ -90,6 +90,41 @@ def _nn_distance(query, ref, max_query=200, rng=None):
     return float(np.mean(d))
 
 
+def shift_nn_ratio(gen_r, history_r, holdout_r, w=126, stride=21, max_query=200, seed=0):
+    """Shift-invariant memorisation test on return sequences.
+
+    Every length-w segment (step ``stride``) of a generated or held-out path is
+    compared with EVERY length-w segment (any offset) of the training return
+    history ``history_r`` (1-D or list of 1-D series), after z-scoring each
+    segment, so a replay of real history shifted by a few days or rescaled is
+    caught. Returns (median gen→history distance, median holdout→history
+    distance, ratio); ratio ≪ 1 suggests memorisation."""
+    rng = np.random.default_rng(seed)
+
+    def segs(paths):
+        out = [p[i:i + w] for p in paths for i in range(0, len(p) - w + 1, stride)]
+        return np.asarray(out, np.float64)
+
+    def z(a):
+        a = a - a.mean(1, keepdims=True)
+        return a / np.maximum(a.std(1, keepdims=True), 1e-12)
+
+    hist = [np.asarray(h, np.float64) for h in (history_r if isinstance(history_r, (list, tuple))
+                                                  else [history_r])]
+    H = z(np.concatenate([np.lib.stride_tricks.sliding_window_view(h, w) for h in hist if len(h) >= w]))
+
+    def med(paths):
+        Q = z(segs(np.asarray(paths, np.float64)))
+        if len(Q) > max_query:
+            Q = Q[rng.choice(len(Q), max_query, replace=False)]
+        # ‖q − h‖² = 2w(1 − corr) for z-scored segments
+        corr = Q @ H.T / w
+        return float(np.median(np.sqrt(np.maximum(2 * w * (1 - corr.max(1)), 0.0))))
+
+    d_gen, d_hold = med(gen_r), med(holdout_r)
+    return d_gen, d_hold, (d_gen / d_hold if d_hold > 0 else float("nan"))
+
+
 def discriminative_auc(real_r, gen_r, seed=0):
     """5-fold CV ROC-AUC of a gradient-boosted classifier on window features.
 

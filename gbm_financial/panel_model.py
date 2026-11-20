@@ -42,6 +42,15 @@ class PanelDiffusion(GBMFinancialDiffusion):
     def _prior_shape(self, B, seq_len):
         return (B, self.K, seq_len)
 
+    pin_anchor = True
+
+    def _anchor_index(self, x):
+        """Position 0 of generated anchor channels (observed channels are masked
+        out of the network input, so they need no pinning)."""
+        cm = self.cond_mask.cpu().numpy()
+        ch = [c for c in self.anchor_channels if cm[c] == 0]
+        return (slice(None), ch, 0) if ch else None
+
     def _set_cond(self, x0):
         """Condition the network(s) on the observed channels of x0 (B, K, L)."""
         self._cond_batch = x0

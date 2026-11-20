@@ -668,6 +668,101 @@ def test_tail_calibration(verbose=True):
     return ok
 
 
+
+def test_audit_fixes(verbose=True, n_epochs=2):
+    """Test 10: noise embedding, anchor pinning, seeded splice reproducibility,
+    min-SNR weights, bank-wide tail map."""
+    import math
+    import tempfile
+    from torch.utils.data import DataLoader
+    from gbm_financial.data import FinancialTimeSeriesDataset
+    from gbm_financial.panel_model import PanelDiffusion
+    from gbm_financial.score_network import ContinuousDiffusionEmbedding
+    from gbm_financial.panel_assembly import TransferMap
+
+    print("\n" + "=" * 60)
+    print("TEST 10: Audit fixes")
+    print("=" * 60)
+    ok = True
+    # (a) noise embedding: neighbouring noise levels must embed similarly
+    smin, smax = 1e-3, 5.0
+    sig = lambda t: smin * (smax / smin) ** t
+    t_of = lambda s: math.log(s / smin) / math.log(smax / smin)
+    sims = {}
+    for mode in ("legacy", "log_sigma"):
+        e = ContinuousDiffusionEmbedding(128, mode=mode)
+        e.noise_fn = sig
+        f = lambda t: torch.cat([(x := (torch.log(sig(t)) / 4 if mode == "log_sigma" else t * 1000)
+                                  .unsqueeze(-1) * e.frequencies).sin(), x.cos()], -1)
+        ts = torch.tensor([t_of(s) for s in (0.01, 0.1, 1.0)])
+        ts2 = torch.tensor([t_of(1.01 * s) for s in (0.01, 0.1, 1.0)])
+        sims[mode] = float(torch.nn.functional.cosine_similarity(f(ts), f(ts2)).min())
+    emb_ok = sims["log_sigma"] > 0.99 and sims["legacy"] < 0.5
+    ok &= emb_ok
+    if verbose:
+        print(f"  embedding cos-sim σ vs 1.01σ: legacy {sims['legacy']:.3f}, log_sigma {sims['log_sigma']:.4f}"
+              f"  {'PASS' if emb_ok else 'FAIL'}")
+
+    # (b,c) tiny panel model: anchors exactly 0 in every sampler; splice reproducible
+    rng = np.random.default_rng(0)
+    N, L = 64, 32
+    m = rng.standard_normal((N, L)) * 0.017
+    X = np.stack([np.cumsum(m, 1) - m[:, :1], np.abs(m) * 2,
+                  np.cumsum(m, 1) - m[:, :1]], 1).astype(np.float32)
+    cfg = {"channels": 16, "diff_emb_dim": 32, "feat_emb_dim": 8, "time_emb_dim": 16,
+           "n_layers": 1, "n_heads": 2, "sde_type": "gbm", "schedule": "exponential",
+           "sigma_min": 1e-3, "sigma_max": 5.0, "n_reverse_steps": 20, "epochs": n_epochs,
+           "batch_size": 16, "lr": 1e-3, "ema_decay": 0.0, "seq_len": L, "precond": "none",
+           "n_channels": 3, "conditional": True, "cond_channels": [2], "anchor_channels": [0, 2],
+           "checkpoint_every": 1000, "hybrid_ode_steps": 6, "hybrid_sde_steps": 20,
+           "noise_embedding": "log_sigma"}
+    with tempfile.TemporaryDirectory() as d:
+        torch.manual_seed(0)
+        pipe = PanelDiffusion(cfg)
+        loader = DataLoader(FinancialTimeSeriesDataset(X), batch_size=16, shuffle=True, drop_last=True)
+        pipe.train(loader, loader, save_dir=d)
+        anchors = {}
+        for smp in ("pc", "em", "ode", "karras", "hybrid"):
+            pipe.config["sampler"] = smp
+            G = pipe.sample_panel(4, L, cond=X[:4], seed=0)
+            anchors[smp] = float(np.abs(G[:, 0, 0]).max())
+        pin_ok = max(anchors.values()) == 0.0
+        pipe.config.update(sampler="hybrid", hybrid_fine_checkpoint=os.path.join(d, "final_model.pth"),
+                           hybrid_fine_sigma=0.05)
+        a = pipe.sample_panel(4, L, cond=X[:4], seed=3)
+        b = pipe.sample_panel(4, L, cond=X[:4], seed=3)
+        rep_ok = np.array_equal(a, b)
+        legacy = PanelDiffusion(dict(cfg, noise_embedding="legacy"))
+        try:
+            legacy.load(os.path.join(d, "final_model.pth"))
+            guard_ok = False
+        except ValueError:
+            guard_ok = True
+    ok &= pin_ok and rep_ok and guard_ok
+    if verbose:
+        print(f"  max |anchor| per sampler {anchors}  {'PASS' if pin_ok else 'FAIL'}")
+        print(f"  seeded splice calls identical: {rep_ok}; embedding-mismatch load refused: {guard_ok}")
+
+    # (d) min-SNR weights for ε-loss: min(SNR, γ)/SNR ∈ (0, 1], 1 at high noise
+    std = torch.tensor([0.01, 0.5, 5.0])
+    snr = 1 / std ** 2
+    w = torch.clamp(snr, max=5.0) / snr
+    snr_ok = bool((w <= 1).all() and w[-1] == 1 and w[0] < 0.01)
+    ok &= snr_ok
+
+    # (e) bank-wide transfer map keeps scenario-to-scenario tail variation
+    gen = [rng.standard_normal(20000) * s for s in (0.7, 1.0, 1.4)]
+    ref = rng.standard_t(3, 200000)
+    tm = TransferMap(np.concatenate(gen), ref)
+    counts = [int((np.abs(tm(g)) > 4).sum()) for g in gen]
+    tail_ok = counts[0] < counts[1] < counts[2]
+    ok &= tail_ok
+    if verbose:
+        print(f"  min-SNR weights {w.numpy().round(4)}  {'PASS' if snr_ok else 'FAIL'}")
+        print(f"  |shock|>4 per scenario after bank map {counts} (must differ)  {'PASS' if tail_ok else 'FAIL'}")
+        print(f"  Result: {'PASS' if ok else 'FAIL'}")
+    return ok
+
 def run_all_tests():
     """Run all validation tests."""
     print("\n" + "#" * 60)
@@ -740,6 +835,13 @@ def run_all_tests():
     except Exception as e:
         results["tail_calib"] = ("ERROR", str(e))
 
+    # Test 10: audit fixes
+    try:
+        passed = test_audit_fixes()
+        results["audit_fixes"] = ("PASS" if passed else "FAIL", "")
+    except Exception as e:
+        results["audit_fixes"] = ("ERROR", str(e))
+
     # Summary
     print("\n" + "=" * 60)
     print("VALIDATION SUMMARY")
@@ -765,7 +867,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--test", type=str, default="all",
                         choices=["all", "oracle", "shapes", "train", "noise", "gen",
-                                 "samplers", "edm", "panel", "tails", "quick"])
+                                 "samplers", "edm", "panel", "tails", "audit", "quick"])
     args = parser.parse_args()
 
     if args.test == "all":
@@ -788,6 +890,8 @@ if __name__ == "__main__":
         test_panel_model()
     elif args.test == "tails":
         test_tail_calibration()
+    elif args.test == "audit":
+        test_audit_fixes()
     elif args.test == "quick":
         # Quick: just oracle + shapes (fast, no training)
         test_sde_oracle()

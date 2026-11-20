@@ -58,19 +58,34 @@ class ContinuousDiffusionEmbedding(nn.Module):
         embedding = _build_embedding(num_steps, dim)   # precomputed table
         x = self.embedding[diffusion_step]             # integer index
 
-    This version:
-        x = sinusoidal(t * 1000, frequencies)          # continuous t ∈ [0, 1]
+    mode="legacy" (default, matches existing checkpoints):
+        x = sinusoidal(t * 1000, 10^(0..4))            # continuous t ∈ [0, 1]
+      CSDI's basis was built for 50 integer steps; on t·1000 its slowest feature
+      cycles ~159 times over t ∈ [0, 1], so the embedding decorrelates when σ
+      changes by ~1% and the network effectively cannot read the noise level.
 
-    Same projection MLP and frequency basis in both cases.
+    mode="log_sigma" (EDM, Karras et al. 2022):
+        c = ln(σ(t)) / 4,  x = sinusoidal(c, (1/10000)^(k/half))
+      All frequencies ≤ 1, so features vary smoothly over the whole σ range.
+      Needs ``noise_fn`` (t → σ); set by FinancialScoreNetwork.set_noise_fn.
+
+    Same projection MLP in both cases.
     """
 
-    def __init__(self, embedding_dim=256, projection_dim=None):
+    def __init__(self, embedding_dim=256, projection_dim=None, mode="legacy"):
         super().__init__()
         if projection_dim is None:
             projection_dim = embedding_dim
         half_dim = embedding_dim // 2
-        # Same frequency basis as CSDI's DiffusionEmbedding._build_embedding
-        frequencies = 10.0 ** (torch.arange(half_dim).float() / (half_dim - 1) * 4.0)
+        if mode not in ("legacy", "log_sigma"):
+            raise ValueError(f"unknown noise embedding mode {mode!r}")
+        self.mode = mode
+        self.noise_fn = None
+        if mode == "legacy":
+            # Same frequency basis as CSDI's DiffusionEmbedding._build_embedding
+            frequencies = 10.0 ** (torch.arange(half_dim).float() / (half_dim - 1) * 4.0)
+        else:
+            frequencies = (1.0 / 10000.0) ** (torch.arange(half_dim).float() / half_dim)
         self.register_buffer("frequencies", frequencies)
         # Same MLP projection as CSDI's DiffusionEmbedding
         self.projection1 = nn.Linear(embedding_dim, projection_dim)
@@ -85,9 +100,14 @@ class ContinuousDiffusionEmbedding(nn.Module):
         """
         if t.dim() == 0:
             t = t.unsqueeze(0)
-        # Scale to [0, 1000] for comparable frequency variation to CSDI's integer steps
-        t_scaled = t.float() * 1000.0
-        table = t_scaled.unsqueeze(-1) * self.frequencies.unsqueeze(0)  # (B, half_dim)
+        if self.mode == "log_sigma":
+            if self.noise_fn is None:
+                raise RuntimeError("log_sigma embedding needs noise_fn (call set_noise_fn)")
+            x_in = torch.log(self.noise_fn(t.float()).clamp(min=1e-20)) / 4.0
+        else:
+            # Scale to [0, 1000] for comparable frequency variation to CSDI's integer steps
+            x_in = t.float() * 1000.0
+        table = x_in.unsqueeze(-1) * self.frequencies.unsqueeze(0)  # (B, half_dim)
         emb = torch.cat([torch.sin(table), torch.cos(table)], dim=-1)  # (B, embedding_dim)
         # Same activation path as CSDI DiffusionEmbedding.forward
         x = self.projection1(emb)
@@ -394,6 +414,7 @@ class FinancialScoreNetwork(CSDI_base):
         self.diffmodel.diffusion_embedding = ContinuousDiffusionEmbedding(
             embedding_dim=diff_emb_dim,
             projection_dim=diff_emb_dim,
+            mode=config.get("noise_embedding", "legacy"),
         )
 
         # --- Paper modification #2: positional encoding in residual blocks ---
@@ -429,6 +450,10 @@ class FinancialScoreNetwork(CSDI_base):
 
         # Move everything to the target device
         self.to(device)
+
+    def set_noise_fn(self, noise_fn):
+        """t → noise level σ(t), used by the log_sigma noise embedding."""
+        self.diffmodel.diffusion_embedding.noise_fn = noise_fn
 
     def set_condition(self, cond, cond_mask):
         """Set conditioning for subsequent forward() calls.

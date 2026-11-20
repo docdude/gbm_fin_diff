@@ -50,31 +50,33 @@ def load_model(exp_dir, fine_ckpt=None, sampler="hybrid", switch=0.5, fine_sigma
 
 
 class EmpiricalOHLC:
-    """Train-period distributions used to place high/low around close and the open."""
+    """Train-period distributions used to place high/low around close and the open.
+
+    For each return-size bin, real days give the joint position of the close and
+    the open inside the day's range (0 = high, 1 = low); one real day is drawn
+    per generated day, so open, close and range stay mutually consistent."""
 
     def __init__(self, P: PanelData):
         z = P.ret / P.stats["ret_std"]
         with np.errstate(divide="ignore", invalid="ignore"):
             hl = np.log(P.high / P.low)
             a = np.log(P.high / P.close) / hl
-        ok = np.isfinite(z) & np.isfinite(a) & (hl > RANGE_FLOOR)
+            bo = np.log(P.high / P.open) / hl
+        ok = np.isfinite(z) & np.isfinite(a) & np.isfinite(bo) & (hl > RANGE_FLOOR)
         zb = np.digitize(z[ok], ZBINS) - 1
         self.a_pools = [np.clip(a[ok][zb == b], 0, 1) for b in range(len(ZBINS) - 1)]
-        gap = np.full_like(P.close, np.nan)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            gap[1:] = np.log(P.open[1:] / P.close[:-1]) / P.stats["ret_std"]
-        self.gap_pool = gap[np.isfinite(gap)]
-        self.gap_pool = self.gap_pool[np.abs(self.gap_pool) < 10]
+        self.o_pools = [np.clip(bo[ok][zb == b], 0, 1) for b in range(len(ZBINS) - 1)]
 
     def sample(self, z, rng):
-        a = np.empty_like(z)
+        """Returns (close position a, open position o) within the day's range."""
+        a, o = np.empty_like(z), np.empty_like(z)
         zb = np.digitize(z, ZBINS) - 1
         for b, pool in enumerate(self.a_pools):
             m = zb == b
             if m.any():
-                a[m] = rng.choice(pool, m.sum())
-        g = rng.choice(self.gap_pool, z.shape)
-        return a, g
+                k = rng.integers(0, len(pool), m.sum())
+                a[m], o[m] = pool[k], self.o_pools[b][k]
+        return a, o
 
 
 def market_path_features(X, mstats):
@@ -224,6 +226,30 @@ def decompose(dc, dm):
     return mu, b, dc - mu - b[:, None] * dmc
 
 
+class TransferMap:
+    """Monotone map from a generated-shock distribution G to a reference R,
+    f = F_R⁻¹ ∘ F_G, fitted once on a pool of generated shocks (a whole bank).
+    Unlike re-ranking each scenario, scenarios keep their own number of large
+    shocks; only the shape of the bank-wide distribution is corrected."""
+
+    def __init__(self, gen, ref, n_q=4001):
+        from scipy.stats import norm
+        q = np.linspace(0.0, 1.0, n_q)
+        self.gq = np.quantile(np.asarray(gen).ravel(), q)
+        self.rq = np.quantile(np.asarray(ref).ravel(), q)
+        qc = np.clip(q, 0.5 / max(np.asarray(gen).size, 2), 1 - 0.5 / max(np.asarray(gen).size, 2))
+        self.zq = norm.ppf(qc)
+
+    def __call__(self, u):
+        return np.interp(u, self.gq, self.rq)
+
+    def to_normal(self, u):
+        return np.interp(u, self.gq, self.zq)
+
+    def from_normal(self, z):
+        return np.interp(z, self.zq, self.rq)
+
+
 def quantile_map(u, ref_sorted):
     """Map u to ref's distribution through u's own pooled empirical CDF."""
     flat = u.ravel()
@@ -242,6 +268,8 @@ class TailCalibrator:
     with the identical pipeline. Timing, volatility clustering, betas and
     correlations are kept; only the conditional tail shape changes. Log-range and
     log-volume channels move with |u| using slopes fitted on real data."""
+
+    ticker_map = None  # bank-wide TransferMap (fit_ticker_bank); None = per-scenario ranks
 
     def __init__(self, P, L, era_start, stride=128, corr_shrink=0.1):
         T = len(P.dates)
@@ -278,6 +306,8 @@ class TailCalibrator:
         self.k_range = self._slope(np.concatenate(du_lr))
         self.k_vol = self._slope(np.concatenate(du_lv))
         self.market_ref = None
+        self.ticker_map = None
+        self._fit_vix_response(P, L, starts)
         self.res_corr = self._corr(S, n_pair, corr_shrink)
 
     @staticmethod
@@ -292,6 +322,30 @@ class TailCalibrator:
         C = (V * np.maximum(w, 1e-3)) @ V.T
         d = np.sqrt(np.diag(C))
         return C / np.outer(d, d)
+
+    def _fit_vix_response(self, P, L, starts):
+        """Real-data response of the log-VIX channel to market shocks:
+        Δv_t = k_s·u_t + k_a·(|u_t| − mean) + noise, and AR(1) persistence φ of
+        v around its window mean. Used to move VIX with calibrated market shocks."""
+        X, Y, V0, V1 = [], [], [], []
+        for s in starts:
+            w = P.market_window(s, L)
+            dm = np.diff(w[0])
+            u = devol((dm - dm.mean())[None])[0][0]
+            v = w[1] - w[1].mean()
+            X.append(np.c_[u, np.abs(u) - np.abs(u).mean()])
+            Y.append(np.diff(w[1]))
+            V0.append(v[:-1]); V1.append(v[1:])
+        X, Y = np.concatenate(X), np.concatenate(Y)
+        self.k_vix = np.linalg.lstsq(X, Y - Y.mean(), rcond=None)[0]
+        V0, V1 = np.concatenate(V0), np.concatenate(V1)
+        self.phi_vix = float(np.clip((V0 * V1).sum() / (V0 ** 2).sum(), 0.0, 0.999))
+
+    def fit_ticker_bank(self, items):
+        """items: iterable of (paths (n,3,L), market (2,L)) raw outputs of a whole bank.
+        Fits one bank-wide transfer map for ticker residual shocks."""
+        U = [devol(decompose(np.diff(p[:, 0], axis=1), np.diff(m[0]))[2])[0] for p, m in items]
+        self.ticker_map = TransferMap(np.concatenate([u.ravel() for u in U]), self.ref_t)
 
     @staticmethod
     def _slope(a):
@@ -311,6 +365,13 @@ class TailCalibrator:
         u2 = quantile_map(pool, self.ref_m)[:1]
         out = path.copy()
         out[0] = path[0, 0] + np.r_[0.0, np.cumsum(mu + u2[0] * sig[0])]
+        # VIX follows the changed shocks (signed + size response, mean-reverting)
+        x = (self.k_vix[0] * (u2[0] - u[0])
+             + self.k_vix[1] * (np.abs(u2[0]) - np.abs(u[0])))
+        adj = np.zeros(len(x) + 1)
+        for t in range(len(x)):
+            adj[t + 1] = self.phi_vix * adj[t] + x[t]
+        out[1] = path[1] + adj
         return out
 
     def tickers(self, paths, market, idx=None):
@@ -320,17 +381,22 @@ class TailCalibrator:
         dm = np.diff(market[0])
         mu, b, e = decompose(dc, dm)
         u, sig = devol(e)
-        if idx is not None and getattr(self, "res_corr", None) is not None:
+        tm = self.ticker_map
+        mix = idx is not None and getattr(self, "res_corr", None) is not None
+        if mix:
             # Gaussian copula: mix normal scores so sector peers co-move without
             # copying each other's idiosyncratic jumps; tails restored by the map below
-            from scipy.stats import norm
-            flat = u.ravel()
-            z = norm.ppf((np.argsort(np.argsort(flat)) + 0.5) / flat.size).reshape(u.shape)
+            if tm is not None:
+                z = tm.to_normal(u)
+            else:
+                from scipy.stats import norm
+                flat = u.ravel()
+                z = norm.ppf((np.argsort(np.argsort(flat)) + 0.5) / flat.size).reshape(u.shape)
             w, V = np.linalg.eigh(self.res_corr[np.ix_(idx, idx)])
-            u_mixed = (V * np.sqrt(np.maximum(w, 0))) @ V.T @ z
+            z = (V * np.sqrt(np.maximum(w, 0))) @ V.T @ z
+            u2 = tm.from_normal(z) if tm is not None else quantile_map(z, self.ref_t)
         else:
-            u_mixed = u
-        u2 = quantile_map(u_mixed, self.ref_t)
+            u2 = tm(u) if tm is not None else quantile_map(u, self.ref_t)
         out = paths.copy()
         out[:, 0, 1:] = paths[:, 0, :1] + np.cumsum(mu + b[:, None] * (dm - dm.mean()) + u2 * sig, axis=1)
         d = np.abs(u2) - np.abs(u)
@@ -455,11 +521,10 @@ class PanelGenerator:
             close = c_start * np.exp(np.r_[0.0, np.cumsum(ret)])
             hl = np.exp(lr / SCALE * S["lrange_dstd"][j] + st["rmean"])
             z = np.r_[0.0, ret / st["vol"]]
-            a, g = self.emp.sample(z, self.rng)
+            a, o = self.emp.sample(z, self.rng)
             high = close * np.exp(a * hl)
             low = high * np.exp(-hl)
-            prev = np.r_[close[0], close[:-1]]
-            open_ = np.clip(prev * np.exp(g * st["vol"]), low, high)
+            open_ = high * np.exp(-o * hl)
             volume = np.exp(lv / SCALE * S["lvol_dstd"][j] + st["vbase"])
             rows.append(pd.DataFrame({"date": dates, "open": open_, "high": high, "low": low,
                                       "close": close, "adjusted_close": close,
@@ -472,9 +537,9 @@ class PanelGenerator:
                            "vix": np.exp(market[1] / SCALE * P.mstats["lvix_dstd"] + P.mstats["lvix_mean"])})
         return df.sort_values(["date", "tic"]).reset_index(drop=True), mk
 
-    def scenario(self, tickers, start_idx, market="model", seed=None, mpath=None):
-        """One scenario; mpath: pre-generated (2, L) market path (overrides ``market``)."""
-        dates = self.P.dates[start_idx:start_idx + self.L]
+    def raw_scenario(self, tickers, start_idx, market="model", seed=None, mpath=None):
+        """Sample one scenario's model outputs (market calibrated, tickers raw).
+        mpath: pre-generated (2, L) market path (overrides ``market``)."""
         if mpath is None:
             mpath = self.market_path(market, start_idx, seed)
         mraw = mpath
@@ -482,12 +547,24 @@ class PanelGenerator:
             mpath = self.tails.market(mpath)
         stats = self.stats_for(tickers, start_idx)
         tpaths = self.ticker_paths(mpath, tickers, stats, seed)
-        self.last_raw = {"market_raw": mraw, "market": mpath, "tickers_raw": tpaths}
+        return {"market_raw": mraw, "market": mpath, "tickers_raw": tpaths}
+
+    def finish_scenario(self, raw, tickers, start_idx):
+        """Ticker calibration + market identity + OHLCV for one raw scenario."""
+        tpaths, mpath = raw["tickers_raw"], raw["market"]
+        stats = self.stats_for(tickers, start_idx)
         if self.tails is not None:
             tpaths = self.tails.tickers(tpaths, mpath, [self.P.tickers.index(t) for t in tickers])
         if self.market_identity:
             tpaths = self.enforce_market_identity(tpaths, mpath, stats)
+        dates = self.P.dates[start_idx:start_idx + self.L]
         return self.to_ohlcv(tpaths, mpath, tickers, dates, max(start_idx - 1, 0), stats)
+
+    def scenario(self, tickers, start_idx, market="model", seed=None, mpath=None):
+        """One scenario end to end (ticker tails mapped with the fitted bank map if
+        set, else per scenario)."""
+        self.last_raw = self.raw_scenario(tickers, start_idx, market, seed, mpath)
+        return self.finish_scenario(self.last_raw, tickers, start_idx)
 
 
 def reassemble(args, P):
@@ -504,16 +581,14 @@ def reassemble(args, P):
         if args.no_sector_corr:
             gen.tails.res_corr = None
     os.makedirs(args.out, exist_ok=True)
+    gen.market_identity = not args.no_market_identity
+    Z = [np.load(f) for f in files]
+    if gen.tails is not None and not args.per_scenario_tails:
+        gen.tails.fit_ticker_bank((z["tickers_raw"], z["market"]) for z in Z)
     manifest = []
-    for k, f in enumerate(files):
-        z = np.load(f)
-        s, tickers, mpath, tp = int(z["start_idx"]), list(z["tickers"]), z["market"], z["tickers_raw"]
-        if gen.tails is not None:
-            tp = gen.tails.tickers(tp, mpath, [P.tickers.index(t) for t in tickers])
-        stats = gen.stats_for(tickers, s)
-        if not args.no_market_identity:
-            tp = gen.enforce_market_identity(tp, mpath, stats)
-        df, mk = gen.to_ohlcv(tp, mpath, tickers, P.dates[s:s + L], max(s - 1, 0), stats)
+    for k, (f, z) in enumerate(zip(files, Z)):
+        s, tickers = int(z["start_idx"]), list(z["tickers"])
+        df, mk = gen.finish_scenario({"tickers_raw": z["tickers_raw"], "market": z["market"]}, tickers, s)
         out = os.path.join(args.out, f"scenario_{k:03d}.csv.gz")
         df.to_csv(out, index=False)
         mk.to_csv(os.path.join(args.out, f"scenario_{k:03d}_market.csv"), index=False)
@@ -553,6 +628,9 @@ def main():
                     help="draw calendar starts at random instead of matching each market path's state")
     ap.add_argument("--no_sector_corr", action="store_true",
                     help="skip injecting the real residual (sector) correlation into ticker shocks")
+    ap.add_argument("--per_scenario_tails", action="store_true",
+                    help="map each scenario's ticker shocks to the reference histogram separately "
+                         "(old behaviour; removes scenario-to-scenario variation in tail counts)")
     ap.add_argument("--no_market_identity", action="store_true",
                     help="skip forcing the tickers' equal-weight return to equal the market path")
     ap.add_argument("--from_raw", default=None,
@@ -629,15 +707,24 @@ def main():
             crng = np.random.default_rng(args.seed + 1)
             starts = [cm.match(p, crng) for p in bank]
     os.makedirs(args.out, exist_ok=True)
-    manifest = []
+    # pass 1: sample every scenario (raw outputs saved, so a crash loses nothing)
+    raws = []
     for k, s in enumerate(starts):
-        df, mk = gen.scenario(tickers, int(s), market=args.market, seed=args.seed + 7919 * k,
-                              mpath=None if bank is None else bank[k])
+        raw = gen.raw_scenario(tickers, int(s), market=args.market, seed=args.seed + 7919 * k,
+                               mpath=None if bank is None else bank[k])
+        np.savez_compressed(os.path.join(args.out, f"scenario_{k:03d}_raw.npz"),
+                            start_idx=int(s), tickers=np.array(tickers), **raw)
+        raws.append(raw)
+        print(f"  sampled {k + 1}/{len(starts)}", flush=True)
+    # pass 2: one bank-wide ticker tail map, then calibrate and write
+    if gen.tails is not None and not args.per_scenario_tails:
+        gen.tails.fit_ticker_bank((r["tickers_raw"], r["market"]) for r in raws)
+    manifest = []
+    for k, (s, raw) in enumerate(zip(starts, raws)):
+        df, mk = gen.finish_scenario(raw, tickers, int(s))
         f = os.path.join(args.out, f"scenario_{k:03d}.csv.gz")
         df.to_csv(f, index=False)
         mk.to_csv(os.path.join(args.out, f"scenario_{k:03d}_market.csv"), index=False)
-        np.savez_compressed(os.path.join(args.out, f"scenario_{k:03d}_raw.npz"),
-                            start_idx=int(s), tickers=np.array(tickers), **gen.last_raw)
         manifest.append({"file": os.path.basename(f), "calendar_start": str(P.dates[s]),
                          "calendar_end": str(P.dates[s + gen.L - 1]), "market": args.market,
                          "rejection_rate": getattr(tm, "last_rejection_rate", 0.0),

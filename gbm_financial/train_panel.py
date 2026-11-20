@@ -24,7 +24,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .compare import compare_returns
+from .compare import compare_returns, shift_nn_ratio
 from .data import FinancialTimeSeriesDataset, ticker_split
 from .panel_data import PanelData, TICKER_CHANNELS, MARKET_CHANNELS, STATE_CHANNELS
 from .panel_model import PanelDiffusion
@@ -56,11 +56,19 @@ def build_data(args, config):
         config.update(n_channels=7, conditional=True, cond_channels=[3, 4, 5, 6], anchor_channels=[0, 3])
     else:
         X, meta = P.market_windows(L=L, stride=args.stride, n_baskets=args.n_baskets, seed=config["seed"])
-        # time-based hold-out for the single market series: last 10% of window starts
+        # time-based hold-out for the single market series: last 10% of window starts,
+        # purged (López de Prado 2018): training windows must END before the first
+        # validation day, otherwise they share days with the validation windows
         starts = np.array([m[1] for m in meta])
-        cut = np.quantile(np.unique(starts).astype("datetime64[D]").astype(float), 0.9)
-        is_val = starts.astype("datetime64[D]").astype(float) >= cut
-        Xtr, Xva = X[~is_val], X[is_val & np.array([m[0] == "EW" for m in meta])]
+        day = {d: i for i, d in enumerate(P.dates)}
+        s_idx = np.array([day[d] for d in starts])
+        cut = int(np.quantile(np.unique(s_idx), 0.9))
+        is_val = s_idx >= cut
+        is_tr = s_idx + L - 1 < cut
+        Xtr, Xva = X[is_tr], X[is_val & np.array([m[0] == "EW" for m in meta])]
+        config["market_cut_date"] = str(P.dates[cut])
+        print(f"market split: cut {P.dates[cut]}, purged {int((~is_val & ~is_tr).sum())} "
+              f"overlapping training windows")
         names = list(MARKET_CHANNELS)
         config.update(n_channels=2, conditional=False, cond_channels=[], anchor_channels=[0])
     config["channel_names"] = names
@@ -135,7 +143,9 @@ def _roll_vol(r, w=20):
     return np.sqrt((c[:, w:] - c[:, :-w]) / w)
 
 
-def evaluate(model, config, Xtr, Xva, out_dir, n_seeds=3, n_per_seed=None):
+def evaluate(model, config, Xtr, Xva, out_dir, n_seeds=3, n_per_seed=None, market_hist=None):
+    """market_hist: scaled EW market returns before the validation cut (training
+    history) for the shift-invariant memorisation test (market model only)."""
     os.makedirs(out_dir, exist_ok=True)
     L = config["seq_len"]
     rng = np.random.default_rng(0)
@@ -148,6 +158,8 @@ def evaluate(model, config, Xtr, Xva, out_dir, n_seeds=3, n_per_seed=None):
         ref = Xva
     real_tr_ret = np.diff(Xtr[:, 0], axis=1)
     real_va_ret = np.diff(Xva[:, 0], axis=1)
+    # training market history (EW channel) for the shift-invariant memorisation test
+    hist_r = market_hist
     results, gens = [], []
     for sd in range(n_seeds):
         t0 = time.time()
@@ -158,6 +170,9 @@ def evaluate(model, config, Xtr, Xva, out_dir, n_seeds=3, n_per_seed=None):
         met = compare_returns(np.diff(G[:, 0], axis=1), real_tr_ret, real_va_ret, seed=sd)
         met.update(panel_metrics(G, ref if config["model"] == "ticker" else Xva, config["model"]))
         met["rejection_rate"] = getattr(model, "last_rejection_rate", 0.0)
+        if config["model"] == "market" and hist_r is not None:
+            g, h, r = shift_nn_ratio(np.diff(G[:, 0], axis=1), hist_r, real_va_ret, seed=sd)
+            met.update(shift_nn_gen=g, shift_nn_holdout=h, shift_nn_ratio=r)
         results.append(met)
         print(f"  seed {sd}: {len(G)} samples in {time.time() - t0:.0f}s", flush=True)
     np.save(os.path.join(out_dir, "real_ref.npy"), ref)
@@ -186,6 +201,10 @@ def main():
     ap.add_argument("--stride", type=int, default=None, help="default 64 (ticker) / 16 (market)")
     ap.add_argument("--n_baskets", type=int, default=8, help="market model basket augmentation")
     ap.add_argument("--precond", choices=["none", "edm"], default="none")
+    ap.add_argument("--noise_embedding", choices=["legacy", "log_sigma"], default="log_sigma",
+                    help="network noise-level embedding for NEW training runs: log_sigma = EDM "
+                         "ln(σ)/4 features; legacy = CSDI sin(t·1000·10^k) (pre-Nov-2026 models). "
+                         "--eval_only always uses the checkpoint's own setting")
     ap.add_argument("--epochs", type=int, default=None)
     ap.add_argument("--seq_len", type=int, default=None)
     ap.add_argument("--sigma_min", type=float, default=None)
@@ -204,7 +223,7 @@ def main():
     args.stride = args.stride or (64 if args.model == "ticker" else 16)
 
     config = dict(BASE_CONFIG, model=args.model)
-    for k in ("precond", "epochs", "seq_len", "sigma_min", "sigma_max"):
+    for k in ("precond", "noise_embedding", "epochs", "seq_len", "sigma_min", "sigma_max"):
         if getattr(args, k) is not None:
             config[k] = getattr(args, k)
     torch.manual_seed(config["seed"])
@@ -219,6 +238,7 @@ def main():
         with open(os.path.join(args.save_dir, "results.json")) as f:
             saved = json.load(f)["config"]
         config.update(saved)
+        config["noise_embedding"] = saved.get("noise_embedding", "legacy")
         for k in ("sampler", "hybrid_sigma_switch", "hybrid_fine_checkpoint", "hybrid_fine_sigma"):
             if getattr(args, k) is not None:
                 config[k] = getattr(args, k)
@@ -250,8 +270,11 @@ def main():
         f"_{config.get('hybrid_sigma_switch')}" if config.get("sampler") == "hybrid" else "") + (
         f"_splice{config.get('hybrid_fine_sigma')}" if config.get("hybrid_fine_checkpoint") else "") + (
         "_filter" if args.reject_failed else ""))
+    hist = None
+    if args.model == "market" and config.get("market_cut_date"):
+        hist = P.m_ret[1:int(np.searchsorted(P.dates, config["market_cut_date"]))]
     evaluate(model, config, Xtr, Xva, os.path.join(args.save_dir, f"eval_{tag}"),
-             n_seeds=args.n_seeds, n_per_seed=args.n_eval)
+             n_seeds=args.n_seeds, n_per_seed=args.n_eval, market_hist=hist)
 
 
 if __name__ == "__main__":

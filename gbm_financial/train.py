@@ -147,6 +147,7 @@ class GBMFinancialDiffusion:
 
         # Score network — subclasses CSDI_base, applies paper's modifications
         self.model = FinancialScoreNetwork(config, self.device)
+        self.model.set_noise_fn(self._noise_level)
         self.precond = config.get("precond", "none")
         if self.precond == "edm":
             if isinstance(self.sde, VPSDE):
@@ -279,6 +280,15 @@ class GBMFinancialDiffusion:
         if self.mask_anchor:
             print(f"  Anchor masking: ON (first timestep excluded from loss)")
 
+    def _noise_level(self, t):
+        """Noise level σ(t) seen by the network: VE/GBM σ(t); VP/sub-VP the
+        equivalent VE level std/mean of the marginal (x_t / mean = x_0 + σ ε)."""
+        if hasattr(self.sde, "_sigma"):
+            return self.sde._sigma(t)
+        ones = torch.ones_like(t)
+        mean, std = self.sde.marginal_prob(ones, t)
+        return std / mean.clamp(min=1e-20)
+
     def compute_loss(self, x_0, eps=1e-5, t=None, z=None):
         """Compute continuous-time denoising score matching loss.
 
@@ -342,11 +352,11 @@ class GBMFinancialDiffusion:
                 weights = weights.unsqueeze(-1)
             losses = losses * weights
         elif self.loss_weighting.startswith("min_snr"):
-            # min-SNR-γ: weight = min(γ, 1/σ²) — upweights low-noise regime
-            # For VE: SNR ∝ 1/σ², so this caps the max weight at γ
+            # min-SNR-γ (Hang et al. 2023) for an ε-prediction loss:
+            # weight = min(SNR, γ) / SNR, with SNR = 1/σ² (VE/GBM)
             gamma = float(self.loss_weighting.split("_")[-1])
             snr = 1.0 / std.pow(2).clamp(min=1e-12)
-            weights = torch.clamp(snr, max=gamma)
+            weights = torch.clamp(snr, max=gamma) / snr
             if weights.dim() == 1:
                 weights = weights.unsqueeze(-1)
             losses = losses * weights
@@ -786,6 +796,8 @@ class GBMFinancialDiffusion:
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
+            z0 = torch.randn_like(x)
+            x = self._pin(x, sigmas[0], z0)
 
             for i in tqdm(range(N), desc="PC sampling", leave=False, mininterval=2.0):
                 t_batch = torch.full((B,), timesteps[i].item(), device=self.device)
@@ -808,6 +820,7 @@ class GBMFinancialDiffusion:
                     x = x_mean + self._noise_scale(sigma) * torch.sqrt(g_sq) * torch.randn_like(x)
                 else:
                     x = x_mean
+                x = self._pin(x, sigmas_next[i], z0)
 
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
@@ -831,6 +844,8 @@ class GBMFinancialDiffusion:
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
+            z0 = torch.randn_like(x)
+            x = self._pin(x, self._level_at(timesteps[0]), z0)
 
             for i in tqdm(range(N - 1), desc="Reverse SDE", leave=False, mininterval=2.0):
                 dt = timesteps[i + 1] - timesteps[i]  # negative
@@ -842,8 +857,9 @@ class GBMFinancialDiffusion:
                 s_noise = self._noise_scale(std.flatten()[0]) if not self._is_vp else 1.0
                 x = (x + (drift - g ** 2 * score) * dt
                      + s_noise * g * torch.sqrt(-dt) * torch.randn_like(x))
+                x = self._pin(x, self._level_at(timesteps[i + 1]), z0)
 
-            x = self._denoise(x, torch.full((B,), eps, device=self.device))
+            x = self._pin(self._denoise(x, torch.full((B,), eps, device=self.device)), 0.0, z0)
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
@@ -881,6 +897,8 @@ class GBMFinancialDiffusion:
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
+            z0 = torch.randn_like(x)
+            x = self._pin(x, sigmas[0], z0)
 
             for i in tqdm(range(N - 1), desc="Karras/Heun", leave=False, mininterval=2.0):
                 h = sigmas[i + 1] - sigmas[i]
@@ -888,8 +906,9 @@ class GBMFinancialDiffusion:
                 x_hat = x + h * d_cur
                 d_next = self.model(x_hat, torch.full((B,), ts[i + 1].item(), device=self.device))
                 x = x + h * 0.5 * (d_cur + d_next)
+                x = self._pin(x, sigmas[i + 1], z0)
 
-            x = self._denoise(x, torch.full((B,), ts[-1].item(), device=self.device))
+            x = self._pin(self._denoise(x, torch.full((B,), ts[-1].item(), device=self.device)), 0.0, z0)
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
@@ -897,6 +916,29 @@ class GBMFinancialDiffusion:
 
     def _prior_shape(self, B, seq_len):
         return (B, seq_len)
+
+    def _anchor_index(self, x):
+        """Index of anchored entries (position 0 of log-price paths)."""
+        return (slice(None), 0)
+
+    def _pin(self, x, level, z0):
+        """Replacement-style anchoring: the anchor's clean value is 0, so its
+        marginal at noise level ``level`` is level·z (z fixed per path); at
+        level 0 it is exactly 0. Keeps the network's inputs on the training
+        distribution (its loss ignores the anchor, so it never learned it)."""
+        if not getattr(self, "pin_anchor", getattr(self, "mask_anchor", False)):
+            return x
+        idx = self._anchor_index(x)
+        if idx is None:
+            return x
+        x[idx] = float(level) * z0[idx]
+        return x
+
+    def _level_at(self, t):
+        """Marginal noise std of a zero-valued entry at time t (scalar)."""
+        _, std = self.sde.marginal_prob(torch.zeros(1, device=self.device),
+                                        torch.full((1,), float(t), device=self.device))
+        return float(std.flatten()[0])
 
     @staticmethod
     def path_lag1_autocorr(paths, data_mode="log_price"):
@@ -997,6 +1039,7 @@ class GBMFinancialDiffusion:
         if self._is_vp:
             raise ValueError("Hybrid sampler is only implemented for VE/GBM SDEs")
 
+        fine_net = self._fine_net()  # build before seeding: its construction consumes RNG
         self._begin_sampling(seed)
         seq_len = seq_len or self.config["seq_len"]
         batch_size = batch_size or min(n_samples, 32)
@@ -1016,7 +1059,6 @@ class GBMFinancialDiffusion:
         sig_sde = torch.exp(torch.linspace(math.log(sw), math.log(s_end), n_sde)).to(self.device)
         t_sde = self.sde.t_from_sigma(sig_sde).to(self.device)
         sig_sde_next = torch.cat([sig_sde[1:], torch.zeros(1, device=self.device)])
-        fine_net = self._fine_net()
         fine_sigma = float(self.config.get("hybrid_fine_sigma", 0.0)) if fine_net is not None else 0.0
 
         print(f"\nGenerating {n_samples} samples (hybrid: Heun {n_ode} steps σ {smax:.3g}→{sw:.3g}, "
@@ -1026,6 +1068,8 @@ class GBMFinancialDiffusion:
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
+            z0 = torch.randn_like(x)
+            x = self._pin(x, sig_ode[0], z0)
 
             for i in tqdm(range(n_ode - 1), desc="Hybrid/Heun", leave=False, mininterval=2.0):
                 h = sig_ode[i + 1] - sig_ode[i]
@@ -1033,6 +1077,7 @@ class GBMFinancialDiffusion:
                 x_hat = x + h * d_cur
                 d_next = self.model(x_hat, torch.full((B,), t_ode[i + 1].item(), device=self.device))
                 x = x + h * 0.5 * (d_cur + d_next)
+                x = self._pin(x, sig_ode[i + 1], z0)
 
             for i in tqdm(range(n_sde), desc="Hybrid/SDE", leave=False, mininterval=2.0):
                 sigma = sig_sde[i]
@@ -1042,6 +1087,7 @@ class GBMFinancialDiffusion:
                 x = x - g_sq / sigma * eps_pred
                 if i < n_sde - 1:
                     x = x + self._noise_scale(sigma) * torch.sqrt(g_sq) * torch.randn_like(x)
+                x = self._pin(x, sig_sde_next[i], z0)
 
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
@@ -1065,6 +1111,8 @@ class GBMFinancialDiffusion:
         while n_remaining > 0:
             B = min(batch_size, n_remaining)
             x = self.sde.prior_sampling(self._prior_shape(B, seq_len)).to(self.device)
+            z0 = torch.randn_like(x)
+            x = self._pin(x, self._level_at(timesteps[0]), z0)
 
             for i in tqdm(range(N - 1), desc="PF-ODE", leave=False, mininterval=2.0):
                 dt = timesteps[i + 1] - timesteps[i]
@@ -1073,8 +1121,9 @@ class GBMFinancialDiffusion:
                 score = -eps_pred / std
                 drift, diffusion = self.sde.sde(x, t_batch)
                 x = x + (drift - 0.5 * _expand(diffusion, x) ** 2 * score) * dt
+                x = self._pin(x, self._level_at(timesteps[i + 1]), z0)
 
-            x = self._denoise(x, torch.full((B,), eps, device=self.device))
+            x = self._pin(self._denoise(x, torch.full((B,), eps, device=self.device)), 0.0, z0)
             all_samples.append(x.cpu().numpy())
             n_remaining -= B
 
@@ -1155,6 +1204,11 @@ class GBMFinancialDiffusion:
         so training can warm-start from pretrained Transformer weights.
         """
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        ck_mode = (checkpoint.get("config") or {}).get("noise_embedding", "legacy")
+        my_mode = self.config.get("noise_embedding", "legacy")
+        if ck_mode != my_mode:
+            raise ValueError(f"{path} was trained with noise_embedding={ck_mode!r} but this model "
+                             f"uses {my_mode!r}; build it from the checkpoint's config")
         result = self.model.load_state_dict(checkpoint["model_state_dict"], strict=False)
         if result.missing_keys:
             print(f"  Warm-start: {len(result.missing_keys)} new keys "
